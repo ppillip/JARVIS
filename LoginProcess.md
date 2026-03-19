@@ -1,7 +1,15 @@
 # Login Process Guide
 
-이 문서는 `NiceCodex`에서 구현한 OpenAI 로그인 흐름을 정리한 개발 가이드다.
+이 문서는 `JARVIS`에서 구현한 OpenAI 로그인 흐름을 정리한 개발 가이드다.
 목표는 다음 프로젝트, 특히 안티그래비티 기반 구현에서 에이전트가 같은 문제를 다시 겪지 않고 그대로 재사용할 수 있게 하는 것이다.
+
+## 포트 정책
+
+JARVIS는 로그인 관련 구성까지 포함해 무조건 `7000`번대 포트만 사용한다.
+
+- 메인 앱: `7300`
+- 프론트엔드: `7400`
+- OAuth loopback callback: `7500`
 
 ## 목표
 
@@ -17,7 +25,7 @@
 정상 동작한 방식은 다음이다.
 
 1. 앱이 OpenAI OAuth authorize URL로 리다이렉트한다.
-2. redirect URI는 `http://localhost:1455/auth/callback`를 사용한다.
+2. redirect URI는 `http://localhost:7500/auth/callback`를 사용한다.
 3. 로그인 중간 상태(`state`, `code_verifier`)는 브라우저 세션이 아니라 로컬 파일에 저장한다.
 4. callback에서 authorization code를 access token / refresh token으로 교환한다.
 5. 토큰은 `auth-profiles.json` 형태로 저장한다.
@@ -27,16 +35,16 @@
 
 처음에는 일반적인 웹앱처럼 다음 구조를 시도했다.
 
-- 시작: `http://127.0.0.1:8000/api/auth/openai`
-- callback: `http://127.0.0.1:8000/api/auth/openai/callback`
+- 시작: `http://127.0.0.1:7300/api/auth/openai`
+- callback: `http://127.0.0.1:7300/api/auth/openai/callback`
 - `state`, `code_verifier`는 브라우저 세션 쿠키에 저장
 
 이 방식은 OpenAI 인증 화면에서 `unknown_error`가 발생했다.
 
-그 다음에는 OpenClaw/Codex CLI 스타일로 callback을 `localhost:1455`로 바꿨다.
+그 다음에는 OpenClaw/Codex CLI 스타일로 callback을 `localhost:7500`로 바꿨다.
 
-- 시작: `127.0.0.1:8000`
-- callback: `localhost:1455`
+- 시작: `127.0.0.1:7300`
+- callback: `localhost:7500`
 
 이때 또 문제가 생겼다.
 
@@ -80,7 +88,7 @@
 
 - `response_type=code`
 - `client_id`
-- `redirect_uri=http://localhost:1455/auth/callback`
+- `redirect_uri=http://localhost:7500/auth/callback`
 - `scope=openid profile email offline_access`
 - `state`
 - `code_challenge`
@@ -217,13 +225,13 @@
 현재 구현은 메인 FastAPI 앱 외에 별도 loopback 앱을 띄운다.
 
 - 호스트: `localhost`
-- 포트: `1455`
+- 포트: `7500`
 - 경로: `/auth/callback`
 
 중요 포인트:
 
-- 메인 앱이 `127.0.0.1:8000`
-- callback 앱이 `localhost:1455`
+- 메인 앱이 `127.0.0.1:7300`
+- callback 앱이 `localhost:7500`
 
 이 구조에서는 브라우저 쿠키를 동일 세션으로 볼 수 없다.
 그래서 pending OAuth 상태를 파일에 저장한 것이다.
@@ -239,7 +247,7 @@
 현재 구현에서 중요한 값:
 
 - `client_id`: 환경변수 `OPENAI_OAUTH_CLIENT_ID`로 주입
-- 기본 `redirect_uri`: `http://localhost:1455/auth/callback`
+- 기본 `redirect_uri`: `http://localhost:7500/auth/callback`
 
 authorize URL에 반드시 포함한 값:
 
@@ -281,7 +289,7 @@ authorize URL에 반드시 포함한 값:
 
 ### 가능하면 유지할 것
 
-- `localhost:1455/auth/callback`
+- `localhost:7500/auth/callback`
 - auth profile 파일 기반 지속성
 - provider key: `openai-codex`
 
@@ -309,7 +317,7 @@ authorize URL에 반드시 포함한 값:
 2. `localhost`와 `127.0.0.1`를 섞고 있지 않은가
 3. `id_token_add_organizations=true`가 들어가는가
 4. `codex_cli_simplified_flow=true`가 들어가는가
-5. callback 포트 `1455`가 실제로 열려 있는가
+5. callback 포트 `7500`가 실제로 열려 있는가
 
 ### 증상: 로그인 후 앱이 미연결 상태
 

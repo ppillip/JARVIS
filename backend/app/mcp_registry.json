@@ -1,0 +1,151 @@
+[
+  {
+    "id": "planner",
+    "name": "Planner MCP",
+    "scope": "계획",
+    "description": "지령을 구조화하고 실행 전 검토 가능한 플랜으로 변환합니다.",
+    "capabilities": [
+      "목표 분해",
+      "우선순위 정리",
+      "플랜 초안 생성"
+    ],
+    "expected_input": "사용자 지령, 제약 조건, 확인 포인트",
+    "expected_output": "플랜 단계, 리스크 포인트, 태스크 초안",
+    "source_url": "http://127.0.0.1:7200/planner/plan",
+    "transport": "http",
+    "auth_required": false,
+    "risk_level": "low",
+    "enabled": true
+  },
+  {
+    "id": "filesystem",
+    "name": "Filesystem MCP",
+    "scope": "파일",
+    "description": "프로젝트 파일 탐색과 생성, 수정 작업을 담당합니다.",
+    "capabilities": [
+      "파일 탐색",
+      "코드 수정",
+      "산출물 생성"
+    ],
+    "expected_input": "작업 경로, 변경 대상, 수정 요구사항",
+    "expected_output": "변경 파일, 구조 정보, 산출물 목록",
+    "source_url": "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem",
+    "package_name": "@modelcontextprotocol/server-filesystem",
+    "transport": "stdio",
+    "auth_required": false,
+    "risk_level": "medium",
+    "enabled": true
+  },
+  {
+    "id": "git",
+    "name": "Git MCP",
+    "scope": "저장소",
+    "description": "저장소 상태, diff, 이력, 브랜치 정보를 조회하거나 조작할 때 사용합니다.",
+    "capabilities": [
+      "변경 이력 조회",
+      "diff 확인",
+      "브랜치 상태 확인"
+    ],
+    "expected_input": "저장소 경로, 조회 대상, git 작업 요구사항",
+    "expected_output": "변경점, 커밋 정보, 저장소 상태",
+    "source_url": "https://github.com/modelcontextprotocol/servers/tree/main/src/git",
+    "package_name": "mcp-server-git",
+    "transport": "stdio",
+    "auth_required": false,
+    "risk_level": "medium",
+    "enabled": false
+  },
+  {
+    "id": "fetch",
+    "name": "Fetch MCP",
+    "scope": "웹조회",
+    "description": "문서나 웹 페이지를 가져와 요약하거나 규격을 확인할 때 사용합니다.",
+    "capabilities": [
+      "문서 조회",
+      "웹 텍스트 수집",
+      "참조 내용 요약"
+    ],
+    "expected_input": "URL, 조회 대상 문서, 필요한 포인트",
+    "expected_output": "문서 본문, 요약, 핵심 참조 정보",
+    "source_url": "https://github.com/modelcontextprotocol/servers/tree/main/src/fetch",
+    "package_name": "@modelcontextprotocol/server-fetch",
+    "transport": "stdio",
+    "auth_required": false,
+    "risk_level": "low",
+    "enabled": true
+  },
+  {
+    "id": "memory",
+    "name": "Memory MCP",
+    "scope": "기억",
+    "description": "세션 중 승인 상태와 의사결정 맥락을 유지합니다.",
+    "capabilities": [
+      "결정사항 보존",
+      "수정 이력 추적",
+      "세션 맥락 주입"
+    ],
+    "expected_input": "이전 플랜, 수정 요청, 승인 이력",
+    "expected_output": "지속 컨텍스트, 후속 판단 힌트",
+    "source_url": "https://github.com/modelcontextprotocol/servers/tree/main/src/memory",
+    "package_name": "@modelcontextprotocol/server-memory",
+    "transport": "stdio",
+    "auth_required": false,
+    "risk_level": "low",
+    "enabled": true
+  },
+  {
+    "id": "github",
+    "name": "GitHub MCP",
+    "scope": "협업",
+    "description": "GitHub 저장소, 이슈, PR, 파일 내용을 조회하고 협업 상태를 반영합니다.",
+    "capabilities": [
+      "이슈 조회",
+      "PR 확인",
+      "원격 저장소 연동"
+    ],
+    "expected_input": "저장소 식별자, 이슈/PR 번호, GitHub 자격 증명",
+    "expected_output": "원격 저장소 상태, 이슈/PR 정보, 협업 컨텍스트",
+    "source_url": "https://github.com/modelcontextprotocol/servers/tree/main/src/github",
+    "package_name": "@modelcontextprotocol/server-github",
+    "transport": "stdio",
+    "auth_required": true,
+    "risk_level": "medium",
+    "enabled": true
+  },
+  {
+    "id": "browser",
+    "name": "Browser MCP",
+    "scope": "검증",
+    "description": "UI 흐름과 렌더링 상태를 검증합니다.",
+    "capabilities": [
+      "시각 검증",
+      "흐름 점검",
+      "렌더링 확인"
+    ],
+    "expected_input": "화면 대상, 검증 시나리오, 비교 기준",
+    "expected_output": "검증 결과, 이슈 목록, 화면 상태",
+    "source_url": "https://modelcontextprotocol.io/",
+    "transport": "virtual",
+    "auth_required": false,
+    "risk_level": "low",
+    "enabled": true
+  },
+  {
+    "id": "docs",
+    "name": "Docs MCP",
+    "scope": "참조",
+    "description": "문서와 레퍼런스를 조회해 규격 판단을 보조합니다.",
+    "capabilities": [
+      "문서 조회",
+      "규격 확인",
+      "참조 요약"
+    ],
+    "expected_input": "문서 대상, API 이름, 필요한 규격 포인트",
+    "expected_output": "참조 정보, 요약 규격, 사용 가이드",
+    "source_url": "https://registry.modelcontextprotocol.io/",
+    "transport": "virtual",
+    "auth_required": false,
+    "risk_level": "low",
+    "enabled": true
+  }
+]

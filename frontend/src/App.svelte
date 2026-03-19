@@ -1,5 +1,5 @@
 <script>
-  import { onMount, tick } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
 
   const phaseLabels = {
     idle: "대기",
@@ -26,6 +26,7 @@
   let mcps = [];
   let selectedMcpId = "planner";
   let activeSideTab = "detail";
+  let mcpSidebarOpen = true;
   let runTimer;
   let authStatus = {
     authenticated: false,
@@ -38,6 +39,7 @@
   let chatBusy = false;
   let previousResponseId = null;
   let commandInputRef;
+  let mcpSocket;
 
   $: selectedMcp = mcps.find((mcp) => mcp.id === selectedMcpId) ?? mcps[0];
   $: activeTask = tasks.find((task) => task.status === "in_progress") ?? tasks[0];
@@ -45,6 +47,7 @@
 
   onMount(async () => {
     await refreshBootstrapState();
+    connectMcpSocket();
 
     const params = new URLSearchParams(window.location.search);
     if (params.get("auth") === "complete") {
@@ -58,6 +61,10 @@
     await focusComposer();
   });
 
+  onDestroy(() => {
+    disconnectMcpSocket();
+  });
+
   async function submitCommand() {
     const trimmed = command.trim();
     if (!trimmed || chatBusy) return;
@@ -68,8 +75,21 @@
       const response = await postJson("/api/chat", {
         message: trimmed,
         previous_response_id: previousResponseId,
+        conversation: buildConversationContext(),
       });
       previousResponseId = response.response_id;
+      if (response.mode === "plan" && response.workflow) {
+        currentCommand = trimmed;
+        revisionCount = 0;
+        phase = response.workflow.phase;
+        approval = response.workflow.approval;
+        plan = response.workflow.plan;
+        tasks = response.workflow.tasks;
+        executionLog = [];
+        mcps = response.workflow.mcps;
+        activeSideTab = "detail";
+        selectedMcpId = response.workflow.plan?.[0]?.recommended_mcp_ids?.[0] ?? selectedMcpId;
+      }
       addMessage("bot", response.reply);
       command = "";
     } catch (error) {
@@ -153,6 +173,16 @@
     chatMessages = [...chatMessages, { type, text }];
   }
 
+  function buildConversationContext() {
+    return chatMessages
+      .filter((item) => item.type === "user" || item.type === "bot" || item.type === "system")
+      .slice(-12)
+      .map((item) => ({
+        role: item.type === "bot" ? "assistant" : item.type,
+        content: item.text,
+      }));
+  }
+
   async function postJson(url, body) {
     const response = await fetch(url, {
       method: "POST",
@@ -199,6 +229,44 @@
     }
   }
 
+  function connectMcpSocket() {
+    disconnectMcpSocket();
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    mcpSocket = new WebSocket(`${protocol}//${window.location.host}/ws/mcps`);
+    mcpSocket.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        if (payload.type === "mcps_updated" && Array.isArray(payload.mcps)) {
+          mcps = payload.mcps;
+          if (!payload.mcps.some((mcp) => mcp.id === selectedMcpId)) {
+            selectedMcpId = payload.mcps[0]?.id ?? "planner";
+          }
+        }
+      } catch (_error) {
+        // Ignore malformed websocket payloads.
+      }
+    };
+    mcpSocket.onclose = () => {
+      window.setTimeout(() => {
+        if (!mcpSocket || mcpSocket.readyState === WebSocket.CLOSED) {
+          connectMcpSocket();
+        }
+      }, 1500);
+    };
+  }
+
+  function disconnectMcpSocket() {
+    if (mcpSocket) {
+      mcpSocket.onclose = null;
+      mcpSocket.close();
+      mcpSocket = null;
+    }
+  }
+
+  function toggleMcpSidebar() {
+    mcpSidebarOpen = !mcpSidebarOpen;
+  }
+
   function loginWithOpenAI() {
     authBusy = true;
     window.location.href = "/api/auth/openai";
@@ -239,13 +307,14 @@
     const response = await fetch("/api/auth/status", { credentials: "include" });
     authStatus = await response.json();
   }
+
 </script>
 
 <svelte:head>
-  <title>NiceCodex</title>
+  <title>JARVIS</title>
 </svelte:head>
 
-<div class="app-shell">
+<div class:sidebar-collapsed={!mcpSidebarOpen} class="app-shell">
   <aside class="mission-sidebar">
     <div>
       <p class="eyebrow">MISSION CONTROL</p>
@@ -291,13 +360,24 @@
   </aside>
 
   <main class="main-panel">
-    <section class="chat-panel">
+    <section class:busy={chatBusy} class="chat-panel">
       <header class="panel-header">
         <div>
           <p class="eyebrow">CHAT INTERFACE</p>
-          <h2>JARVIS Console</h2>
+          <div class="panel-title-row">
+            <h2>JARVIS Console</h2>
+            <div class:active={chatBusy} class="processing-indicator">
+              <span class="processing-dot"></span>
+              <span>{chatBusy ? "PROCESSING" : "STANDBY"}</span>
+            </div>
+          </div>
         </div>
-        <button class="ghost-button" on:click={resetSession}>세션 초기화</button>
+        <div class="header-actions">
+          <button class="ghost-button" on:click={resetSession}>세션 초기화</button>
+          <button class="ghost-button sidebar-toggle" on:click={toggleMcpSidebar}>
+            {mcpSidebarOpen ? "MCP 숨기기" : "MCP 열기"}
+          </button>
+        </div>
       </header>
 
       <div class="chat-log">
@@ -315,7 +395,15 @@
           <ul class={`item-list ${plan.length ? "" : "empty-state"}`}>
             {#if plan.length}
               {#each plan as step}
-                <li>{step}</li>
+                <li>
+                  <strong>{step.step}</strong>
+                  {#if step.recommended_mcp_ids?.length}
+                    <div class="task-meta">추천 MCP: {formatMcpNames(step.recommended_mcp_ids)}</div>
+                  {/if}
+                  {#if step.rationale}
+                    <div class="task-meta">{step.rationale}</div>
+                  {/if}
+                </li>
               {/each}
             {:else}
               <li>아직 생성된 플랜이 없습니다.</li>
@@ -371,6 +459,7 @@
       </div>
 
       <form
+        class:busy={chatBusy}
         class="composer"
         on:submit|preventDefault={submitCommand}
       >
@@ -382,14 +471,14 @@
           rows="3"
           placeholder="예: 새 랜딩 페이지를 만들고, API 연동 전까지는 목업 데이터로 검증해."
         ></textarea>
-        <button class="primary-button" disabled={chatBusy} type="submit">
+        <button class:pulse={chatBusy} class="primary-button" disabled={chatBusy} type="submit">
           {chatBusy ? "처리 중..." : "질문 보내기"}
         </button>
       </form>
     </section>
   </main>
 
-  <aside class="mcp-sidebar">
+  <aside class:open={mcpSidebarOpen} class="mcp-sidebar">
     <section class="mcp-panel">
       <div>
         <p class="eyebrow">MCP REGISTRY</p>

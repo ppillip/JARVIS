@@ -2,10 +2,26 @@
 
 Python 백엔드와 Svelte 프론트엔드로 구성한 승인 기반 자비스형 챗봇입니다.
 
+## 포트 정책
+
+JARVIS는 앞으로 무조건 `7000`번대 포트만 사용합니다.
+
+- MCP Registry: `7100`
+- Planner MCP: `7200`
+- Main Backend: `7300`
+- Frontend: `7400`
+- OAuth loopback callback: `7500`
+
+다른 프로젝트 에이전트는 이 포트대를 피해서 사용해야 합니다.
+
 ## 구조
 
 - `backend/`
   FastAPI API 서버
+- `backend/app/registry.py`
+  MCP registry 전용 서버
+- `backend/app/planner.py`
+  Planner MCP 전용 서버
 - `frontend/`
   Svelte + Vite UI
 - `soul.md`
@@ -40,10 +56,13 @@ export OPENAI_OAUTH_CLIENT_ID="your-openai-oauth-client-id"
 선택 환경변수:
 
 ```bash
-export OPENAI_OAUTH_REDIRECT_URI="http://localhost:1455/auth/callback"
-export FRONTEND_APP_URL="http://127.0.0.1:5173"
+export OPENAI_OAUTH_REDIRECT_URI="http://localhost:7500/auth/callback"
+export FRONTEND_APP_URL="http://127.0.0.1:7400"
+export OPENAI_OAUTH_LOOPBACK_PORT="7500"
 export SESSION_SECRET="replace-this-in-real-use"
 export OPENAI_API_KEY="your-openai-api-key"
+export MCP_REGISTRY_URL="http://127.0.0.1:7100/registry/mcps"
+export PLANNER_MCP_URL="http://127.0.0.1:7200/planner/plan"
 ```
 
 또는 `backend/.env.example`를 복사해 `backend/.env`로 둘 수 있습니다.
@@ -51,7 +70,7 @@ export OPENAI_API_KEY="your-openai-api-key"
 주의:
 
 - `OPENAI_OAUTH_REDIRECT_URI`는 OAuth redirect URI와 정확히 일치해야 합니다.
-- 기본값은 OpenClaw/Codex CLI 스타일 loopback callback인 `http://localhost:1455/auth/callback`입니다.
+- 기본값은 OpenClaw/Codex CLI 스타일 loopback callback인 `http://localhost:7500/auth/callback`입니다.
 - 로그인 중간 상태(`state`, `code_verifier`)도 loopback callback 호환을 위해 로컬 상태 파일에 보관합니다.
 - 실제 세션 유지는 `~/.nicecodex/agent/auth-profiles.json`에 저장된 인증 프로필을 기준으로 이뤄집니다.
 - 로그아웃은 현재 활성 프로필을 저장소에서 제거합니다.
@@ -59,19 +78,47 @@ export OPENAI_API_KEY="your-openai-api-key"
 
 ## 실행 방법
 
-### 1. 백엔드
+### 1. MCP Registry 서버
 
 ```bash
 cd backend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-uvicorn app.main:app --reload
+uvicorn app.registry:app --reload --port 7100
 ```
 
-기본 주소: `http://127.0.0.1:8000`
+기본 주소: `http://127.0.0.1:7100`
 
-### 2. 프론트엔드
+### 2. Planner MCP 서버
+
+```bash
+cd backend
+source .venv/bin/activate
+uvicorn app.planner:app --reload --port 7200
+```
+
+기본 주소: `http://127.0.0.1:7200`
+
+### 3. 메인 백엔드
+
+```bash
+cd backend
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 7300
+```
+
+기본 주소: `http://127.0.0.1:7300`
+
+메인 백엔드는 기본적으로:
+- `MCP_REGISTRY_URL`로 registry server를 호출해 MCP 목록을 받습니다.
+- `PLANNER_MCP_URL`로 planner service를 호출해 MCP-aware 플랜을 받습니다.
+
+둘 중 하나가 내려가 있으면 fallback 경로를 시도합니다.
+
+### 4. 프론트엔드
 
 ```bash
 cd frontend
@@ -79,9 +126,14 @@ npm install
 npm run dev
 ```
 
-기본 주소: `http://127.0.0.1:5173`
+기본 주소: `http://127.0.0.1:7400`
 
 Vite dev server는 `/api` 요청을 백엔드로 프록시합니다.
+
+관리자용 MCP 레지스트리 화면은 해시 경로로 분리되어 있습니다.
+
+- 사용자 화면: `http://127.0.0.1:7400/`
+- 관리자 화면: `http://127.0.0.1:7400/#/registry-admin`
 
 ## 다음 확장 후보
 

@@ -4,8 +4,10 @@ import base64
 import asyncio
 import fcntl
 import hashlib
+import json
 import os
 from pathlib import Path
+import re
 import secrets
 import threading
 import time
@@ -15,7 +17,7 @@ from urllib.parse import urlencode
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
@@ -23,6 +25,11 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 load_dotenv()
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MCP_REGISTRY_PATH = PROJECT_ROOT / "backend" / "app" / "mcp_registry.json"
+MCP_REGISTRY_URL = os.getenv("MCP_REGISTRY_URL", "http://127.0.0.1:7100/registry/mcps")
+PLANNER_MCP_URL = os.getenv("PLANNER_MCP_URL", "http://127.0.0.1:7200/planner/plan")
 
 
 class MpcDefinition(BaseModel):
@@ -33,6 +40,18 @@ class MpcDefinition(BaseModel):
     capabilities: List[str]
     expected_input: str
     expected_output: str
+    source_url: Optional[str] = None
+    package_name: Optional[str] = None
+    transport: Optional[str] = None
+    auth_required: bool = False
+    risk_level: Literal["low", "medium", "high"] = "low"
+    enabled: bool = True
+
+
+class PlanStep(BaseModel):
+    step: str
+    rationale: str = ""
+    recommended_mcp_ids: List[str] = Field(default_factory=list)
 
 
 class CommandRequest(BaseModel):
@@ -45,18 +64,21 @@ class ReviewRequest(BaseModel):
 
 
 class ApproveRequest(BaseModel):
-    plan: List[str] = Field(default_factory=list, min_length=1)
+    plan: List[PlanStep] = Field(default_factory=list, min_length=1)
 
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1)
     previous_response_id: Optional[str] = None
+    conversation: List[Dict[str, str]] = Field(default_factory=list)
 
 
 class ChatResponse(BaseModel):
     reply: str
     response_id: Optional[str] = None
     model: str
+    mode: Literal["answer", "plan"] = "answer"
+    workflow: Optional[Dict[str, Any]] = None
 
 
 class TaskItem(BaseModel):
@@ -70,9 +92,29 @@ class WorkflowResponse(BaseModel):
     phase: str
     approval: str
     message: str
-    plan: List[str]
+    plan: List[PlanStep]
     tasks: List[TaskItem]
     mcps: List[MpcDefinition]
+
+
+class RegistryToggleRequest(BaseModel):
+    enabled: bool
+
+
+class RegistryCreateRequest(BaseModel):
+    id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    scope: str = Field(..., min_length=1)
+    description: str = Field(..., min_length=1)
+    capabilities: List[str] = Field(default_factory=list)
+    expected_input: str = Field(..., min_length=1)
+    expected_output: str = Field(..., min_length=1)
+    source_url: Optional[str] = None
+    package_name: Optional[str] = None
+    transport: Optional[str] = None
+    auth_required: bool = False
+    risk_level: Literal["low", "medium", "high"] = "low"
+    enabled: bool = True
 
 
 class AuthStatusResponse(BaseModel):
@@ -86,7 +128,7 @@ class AuthStatusResponse(BaseModel):
     error: Optional[str] = None
 
 
-MCP_CATALOG = [
+DEFAULT_MCP_CATALOG = [
     MpcDefinition(
         id="planner",
         name="Planner MCP",
@@ -149,16 +191,15 @@ OPENAI_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 OPENAI_OAUTH_SCOPES = "openid profile email offline_access"
 STATE_DIR = Path(os.getenv("NICECODEX_STATE_DIR", str(Path.home() / ".nicecodex")))
 AGENT_DIR = STATE_DIR / "agent"
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOUL_PATH = PROJECT_ROOT / "soul.md"
 AUTH_PROFILES_PATH = AGENT_DIR / "auth-profiles.json"
 AUTH_PROFILES_LOCK_PATH = AGENT_DIR / "auth-profiles.lock"
 PENDING_OAUTH_PATH = AGENT_DIR / "pending-oauth.json"
 PENDING_OAUTH_LOCK_PATH = AGENT_DIR / "pending-oauth.lock"
 LOOPBACK_CALLBACK_HOST = os.getenv("OPENAI_OAUTH_LOOPBACK_HOST", "localhost")
-LOOPBACK_CALLBACK_PORT = int(os.getenv("OPENAI_OAUTH_LOOPBACK_PORT", "1455"))
+LOOPBACK_CALLBACK_PORT = int(os.getenv("OPENAI_OAUTH_LOOPBACK_PORT", "7500"))
 
-app = FastAPI(title="NiceCodex API")
+app = FastAPI(title="JARVIS API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -174,7 +215,7 @@ app.add_middleware(
     https_only=False,
 )
 
-loopback_app = FastAPI(title="NiceCodex OAuth Loopback")
+loopback_app = FastAPI(title="JARVIS OAuth Loopback")
 loopback_app.add_middleware(
     SessionMiddleware,
     secret_key=os.getenv("SESSION_SECRET", "nicecodex-dev-secret"),
@@ -186,6 +227,134 @@ _loopback_server_started = False
 _loopback_server_lock = threading.Lock()
 
 
+class McpWebSocketHub:
+    def __init__(self) -> None:
+        self.connections: List[WebSocket] = []
+        self.lock = asyncio.Lock()
+
+    async def connect(self, websocket: WebSocket) -> None:
+        await websocket.accept()
+        async with self.lock:
+            self.connections.append(websocket)
+
+    async def disconnect(self, websocket: WebSocket) -> None:
+        async with self.lock:
+            if websocket in self.connections:
+                self.connections.remove(websocket)
+
+    async def broadcast(self, payload: Dict[str, Any]) -> None:
+        stale: List[WebSocket] = []
+        async with self.lock:
+            for websocket in self.connections:
+                try:
+                    await websocket.send_json(payload)
+                except Exception:
+                    stale.append(websocket)
+            for websocket in stale:
+                if websocket in self.connections:
+                    self.connections.remove(websocket)
+
+
+mcp_ws_hub = McpWebSocketHub()
+
+
+def load_mcp_catalog() -> List[MpcDefinition]:
+    try:
+        raw = fetch_registry_entries()
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("registry must be a non-empty list")
+        return [MpcDefinition(**item) for item in raw if item.get("enabled", True)]
+    except Exception:
+        try:
+            raw = json.loads(MCP_REGISTRY_PATH.read_text(encoding="utf-8"))
+            if not isinstance(raw, list) or not raw:
+                raise ValueError("registry file must be a non-empty list")
+            return [MpcDefinition(**item) for item in raw if item.get("enabled", True)]
+        except Exception:
+            return DEFAULT_MCP_CATALOG
+
+
+def fetch_registry_entries() -> List[Dict[str, Any]]:
+    with httpx.Client(timeout=5.0) as client:
+        response = client.get(MCP_REGISTRY_URL)
+        response.raise_for_status()
+        data = response.json()
+    if not isinstance(data, list):
+        raise RuntimeError("Registry server returned invalid payload.")
+    return data
+
+
+def get_registry_base_url() -> str:
+    return MCP_REGISTRY_URL.removesuffix("/registry/mcps")
+
+
+def serialize_mcps_for_prompt(mcps: List[MpcDefinition]) -> str:
+    return json.dumps(
+        [
+            {
+                "id": mcp.id,
+                "name": mcp.name,
+                "scope": mcp.scope,
+                "description": mcp.description,
+                "capabilities": mcp.capabilities,
+                "expected_input": mcp.expected_input,
+                "expected_output": mcp.expected_output,
+                "auth_required": mcp.auth_required,
+                "risk_level": mcp.risk_level,
+                "transport": mcp.transport,
+            }
+            for mcp in mcps
+        ],
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def extract_json_object(text: str) -> Dict[str, Any]:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", stripped, re.DOTALL)
+        if not match:
+            raise
+        return json.loads(match.group(0))
+
+
+def validate_mcp_ids(ids: List[str], mcps: List[MpcDefinition]) -> List[str]:
+    known_ids = {mcp.id for mcp in mcps}
+    return [mcp_id for mcp_id in ids if mcp_id in known_ids]
+
+
+def fallback_plan(command: str, detailed: bool) -> List[PlanStep]:
+    base_plan = [
+        f'지령의 목표와 산출물을 분해한다: "{command}"',
+        "제약 조건과 확인 포인트를 정리해 검토 가능한 실행안으로 만든다.",
+        "승인 후 바로 수행할 수 있는 태스크 묶음으로 전환한다.",
+    ]
+
+    if detailed:
+        base_plan = [
+            f'지령의 핵심 목표를 정의한다: "{command}"',
+            "사용자 확인이 필요한 판단 지점을 분리한다.",
+            "필요한 준비물과 의존성을 사전에 점검한다.",
+            "실행 순서를 작업 단위로 세분화한다.",
+            "각 작업의 완료 기준과 검증 포인트를 명시한다.",
+        ]
+
+    return [
+        PlanStep(
+            step=item,
+            rationale="LLM 플랜 생성 실패로 기본 플랜을 사용합니다.",
+            recommended_mcp_ids=map_task_to_mcps(item, index),
+        )
+        for index, item in enumerate(base_plan)
+    ]
+
+
 @app.get("/api/health")
 def health_check() -> dict[str, str]:
     return {"status": "ok"}
@@ -193,7 +362,78 @@ def health_check() -> dict[str, str]:
 
 @app.get("/api/mcps", response_model=List[MpcDefinition])
 def list_mcps() -> List[MpcDefinition]:
-    return MCP_CATALOG
+    return load_mcp_catalog()
+
+
+@app.websocket("/ws/mcps")
+async def mcp_updates_ws(websocket: WebSocket) -> None:
+    await mcp_ws_hub.connect(websocket)
+    try:
+        await websocket.send_json(
+            {
+                "type": "mcps_updated",
+                "mcps": [item.model_dump() for item in load_mcp_catalog()],
+            }
+        )
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        await mcp_ws_hub.disconnect(websocket)
+    except Exception:
+        await mcp_ws_hub.disconnect(websocket)
+
+
+@app.get("/api/registry/mcps")
+def list_registry_mcps() -> List[Dict[str, Any]]:
+    try:
+        return fetch_registry_entries()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Registry server request failed: {exc}") from exc
+
+
+@app.post("/api/registry/mcps")
+async def create_registry_mcp(payload: RegistryCreateRequest) -> Dict[str, Any]:
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            response = client.post(f"{get_registry_base_url()}/registry/mcps", json=payload.model_dump())
+            response.raise_for_status()
+            created = response.json()
+        await mcp_ws_hub.broadcast(
+            {
+                "type": "mcps_updated",
+                "mcps": [item.model_dump() for item in load_mcp_catalog()],
+            }
+        )
+        return created
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text or "Registry create failed."
+        raise HTTPException(status_code=exc.response.status_code, detail=detail) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Registry server request failed: {exc}") from exc
+
+
+@app.patch("/api/registry/mcps/{mcp_id}")
+async def update_registry_mcp(mcp_id: str, payload: RegistryToggleRequest) -> Dict[str, Any]:
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            response = client.patch(
+                f"{get_registry_base_url()}/registry/mcps/{mcp_id}",
+                json=payload.model_dump(),
+            )
+            response.raise_for_status()
+            updated = response.json()
+        await mcp_ws_hub.broadcast(
+            {
+                "type": "mcps_updated",
+                "mcps": [item.model_dump() for item in load_mcp_catalog()],
+            }
+        )
+        return updated
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text or "Registry update failed."
+        raise HTTPException(status_code=exc.response.status_code, detail=detail) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Registry server request failed: {exc}") from exc
 
 
 @app.get("/api/auth/openai")
@@ -340,87 +580,121 @@ def auth_logout(request: Request) -> AuthStatusResponse:
 async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
     _ = request
     model = os.getenv("CODEX_CHAT_MODEL", "default")
+    message = payload.message.strip()
+    mcps = load_mcp_catalog()
+
+    try:
+        intent = await classify_chat_intent(model=model, message=message, mcps=mcps)
+    except RuntimeError:
+        intent = fallback_chat_intent(message)
+
+    if intent == "command":
+        plan = await build_plan(command=message, detailed=False, mcps=mcps)
+        workflow = WorkflowResponse(
+            phase="review",
+            approval="pending",
+            message="지령을 분석해 MCP-aware 플랜 초안을 생성했습니다. 검토 후 승인하거나 수정하십시오.",
+            plan=plan,
+            tasks=[],
+            mcps=mcps,
+        )
+        return ChatResponse(
+            reply="지령을 분석해 MCP-aware 플랜 초안을 생성했습니다. 아래 단계를 검토해 주십시오.",
+            response_id=None,
+            model=model,
+            mode="plan",
+            workflow=workflow.model_dump(),
+        )
+
     try:
         reply, response_id = await create_chat_response(
             model=model,
-            message=payload.message.strip(),
+            message=message,
             previous_response_id=payload.previous_response_id,
+            conversation=payload.conversation,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    return ChatResponse(reply=reply, response_id=response_id, model=model)
+    return ChatResponse(reply=reply, response_id=response_id, model=model, mode="answer")
 
 
 @app.post("/api/command", response_model=WorkflowResponse)
-def create_plan(payload: CommandRequest) -> WorkflowResponse:
+async def create_plan(payload: CommandRequest) -> WorkflowResponse:
     command = payload.command.strip()
-    plan = build_plan(command, detailed=False)
+    mcps = load_mcp_catalog()
+    plan = await build_plan(command, detailed=False, mcps=mcps)
     return WorkflowResponse(
         phase="review",
         approval="pending",
         message="지령을 분석해 플랜 초안을 생성했습니다. 검토 후 승인하거나 수정하십시오.",
         plan=plan,
         tasks=[],
-        mcps=MCP_CATALOG,
+        mcps=mcps,
     )
 
 
 @app.post("/api/review", response_model=WorkflowResponse)
-def revise_plan(payload: ReviewRequest) -> WorkflowResponse:
+async def revise_plan(payload: ReviewRequest) -> WorkflowResponse:
     command = payload.command.strip()
-    plan = build_plan(command, detailed=True)
+    mcps = load_mcp_catalog()
+    plan = await build_plan(command, detailed=True, mcps=mcps)
     return WorkflowResponse(
         phase="review",
         approval="pending",
         message=f"수정 요청 {payload.revision_count}회를 반영해 플랜을 더 세분화했습니다.",
         plan=plan,
         tasks=[],
-        mcps=MCP_CATALOG,
+        mcps=mcps,
     )
 
 
 @app.post("/api/approve", response_model=WorkflowResponse)
 def approve_plan(payload: ApproveRequest) -> WorkflowResponse:
-    tasks = build_tasks(payload.plan)
+    mcps = load_mcp_catalog()
+    tasks = build_tasks(payload.plan, mcps)
     return WorkflowResponse(
         phase="tasking",
         approval="approved",
         message="플랜 승인이 기록되었습니다. 승인된 플랜을 실행 태스크로 확정했습니다.",
         plan=payload.plan,
         tasks=tasks,
-        mcps=MCP_CATALOG,
+        mcps=mcps,
     )
 
 
-def build_plan(command: str, detailed: bool) -> List[str]:
-    base_plan = [
-        f'지령의 목표와 산출물을 분해한다: "{command}"',
-        "제약 조건과 확인 포인트를 정리해 검토 가능한 실행안으로 만든다.",
-        "승인 후 바로 수행할 수 있는 태스크 묶음으로 전환한다.",
-    ]
+async def build_plan(command: str, detailed: bool, mcps: List[MpcDefinition]) -> List[PlanStep]:
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                PLANNER_MCP_URL,
+                json={
+                    "command": command,
+                    "detailed": detailed,
+                    "mcps": [mcp.model_dump() for mcp in mcps],
+                },
+            )
+            response.raise_for_status()
+        payload = response.json()
+        items = payload.get("plan")
+        if isinstance(items, list) and items:
+            return [PlanStep(**item) for item in items]
+    except Exception:
+        pass
 
-    if not detailed:
-        return base_plan
-
-    return [
-        f'지령의 핵심 목표를 정의한다: "{command}"',
-        "사용자 확인이 필요한 판단 지점을 분리한다.",
-        "필요한 준비물과 의존성을 사전에 점검한다.",
-        "실행 순서를 작업 단위로 세분화한다.",
-        "각 작업의 완료 기준과 검증 포인트를 명시한다.",
-    ]
+    return fallback_plan(command, detailed)
 
 
-def build_tasks(plan: List[str]) -> List[TaskItem]:
+def build_tasks(plan: List[PlanStep], mcps: List[MpcDefinition]) -> List[TaskItem]:
     tasks: List[TaskItem] = []
     for index, item in enumerate(plan, start=1):
+        mcp_ids = validate_mcp_ids(item.recommended_mcp_ids, mcps) or map_task_to_mcps(item.step, index - 1)
         tasks.append(
             TaskItem(
                 id=index,
-                title=item.rstrip("."),
+                title=item.step.rstrip("."),
                 status="queued",
-                mcp_ids=map_task_to_mcps(item, index - 1),
+                mcp_ids=mcp_ids,
             )
         )
     return tasks
@@ -470,7 +744,7 @@ def get_openai_redirect_uri() -> str:
 
 
 def get_frontend_callback_redirect() -> str:
-    return os.getenv("FRONTEND_APP_URL", "http://127.0.0.1:5173") + "/?auth=complete"
+    return os.getenv("FRONTEND_APP_URL", "http://127.0.0.1:7400") + "/?auth=complete"
 
 
 def build_pkce_challenge(verifier: str) -> str:
@@ -494,24 +768,40 @@ def get_active_openai_credential(request: Request) -> Dict[str, Any]:
     return credential
 
 
-async def create_chat_response(
+def fallback_chat_intent(message: str) -> Literal["question", "command"]:
+    normalized = message.strip().lower()
+    command_markers = ["구현", "만들", "고쳐", "정리", "설계", "추가", "삭제", "수정", "작성", "해줘", "해라"]
+    if "?" in normalized:
+        return "question"
+    if any(marker in normalized for marker in command_markers):
+        return "command"
+    return "question"
+
+
+async def classify_chat_intent(
     model: str,
     message: str,
-    previous_response_id: Optional[str],
-) -> tuple[str, Optional[str]]:
-    _ = previous_response_id
-    soul_prompt = read_soul_prompt()
-    system_prompt = (
-        "너는 NiceCodex의 채팅 처리 엔진이다. "
-        "항상 한국어로 답하고, 간결하지만 실제로 도움이 되게 답해라. "
-        "코드/개발 질문이면 실무적으로 답하고, 모르면 추측하지 말고 부족한 점을 짧게 밝혀라."
+    mcps: List[MpcDefinition],
+) -> Literal["question", "command"]:
+    prompt = (
+        "너는 사용자의 입력이 '일반 질문'인지 '실행해야 할 지령'인지 분류하는 분류기다.\n"
+        "반드시 JSON 객체 하나만 출력한다.\n"
+        '형식: {"intent":"question"} 또는 {"intent":"command"}\n'
+        "판정 기준:\n"
+        "- question: 설명, 정의, 비교, 의견, 원인 질문\n"
+        "- command: 무언가를 만들기/고치기/설계하기/진행하기를 요구하는 지시\n\n"
+        f"[현재 MCP REGISTRY]\n{serialize_mcps_for_prompt(mcps)}\n\n"
+        f"[사용자 입력]\n{message}"
     )
-    full_prompt = (
-        f"{system_prompt}\n\n"
-        f"[SOUL]\n{soul_prompt}\n\n"
-        f"[사용자 질문]\n{message}"
-    )
+    raw, _ = await run_codex_exec(model=model, prompt=prompt)
+    parsed = extract_json_object(raw)
+    intent = str(parsed.get("intent", "")).strip().lower()
+    if intent not in {"question", "command"}:
+        raise RuntimeError("intent classification failed")
+    return intent  # type: ignore[return-value]
 
+
+async def run_codex_exec(model: str, prompt: str) -> tuple[str, Optional[str]]:
     with tempfile.NamedTemporaryFile(delete=False) as output_file:
         output_path = output_file.name
 
@@ -522,13 +812,13 @@ async def create_chat_response(
         "--sandbox",
         "read-only",
         "-C",
-        str(Path.cwd()),
+        str(PROJECT_ROOT),
         "-o",
         output_path,
     ]
     if model != "default":
         cmd.extend(["-m", model])
-    cmd.append(full_prompt)
+    cmd.append(prompt)
 
     process = await asyncio.create_subprocess_exec(
         *cmd,
@@ -550,6 +840,48 @@ async def create_chat_response(
         raise RuntimeError("Codex CLI returned an empty reply.")
 
     return reply, None
+
+
+async def create_chat_response(
+    model: str,
+    message: str,
+    previous_response_id: Optional[str],
+    conversation: List[Dict[str, str]],
+) -> tuple[str, Optional[str]]:
+    _ = previous_response_id
+    soul_prompt = read_soul_prompt()
+    system_prompt = (
+        "너는 JARVIS의 채팅 처리 엔진이다. "
+        "항상 한국어로 답하고, 간결하지만 실제로 도움이 되게 답해라. "
+        "코드/개발 질문이면 실무적으로 답하고, 모르면 추측하지 말고 부족한 점을 짧게 밝혀라."
+    )
+    conversation_prompt = format_conversation_history(conversation)
+    full_prompt = (
+        f"{system_prompt}\n\n"
+        f"[SOUL]\n{soul_prompt}\n\n"
+        f"[대화 히스토리]\n{conversation_prompt}\n\n"
+        f"[사용자 질문]\n{message}"
+    )
+    return await run_codex_exec(model=model, prompt=full_prompt)
+
+
+def format_conversation_history(conversation: List[Dict[str, str]]) -> str:
+    if not conversation:
+        return "이전 대화 없음"
+
+    lines: List[str] = []
+    for item in conversation[-12:]:
+        role = str(item.get("role", "")).strip().lower()
+        content = str(item.get("content", "")).strip()
+        if not content:
+            continue
+        if role == "user":
+            lines.append(f"USER: {content}")
+        elif role == "assistant":
+            lines.append(f"ASSISTANT: {content}")
+        elif role == "system":
+            lines.append(f"SYSTEM: {content}")
+    return "\n".join(lines) if lines else "이전 대화 없음"
 
 
 def read_soul_prompt() -> str:
