@@ -1,4 +1,4 @@
-# NiceCodex
+# JARVIS
 
 Python 백엔드와 Svelte 프론트엔드로 구성한 승인 기반 자비스형 챗봇입니다.
 
