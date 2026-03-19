@@ -10,9 +10,10 @@ JARVIS는 앞으로 무조건 `7000`번대 포트만 사용합니다.
 - Planner MCP: `7200`
 - Main Backend: `7300`
 - Frontend: `7400`
-- OAuth loopback callback: `7500`
+- OAuth loopback callback: `1455` (OpenAI/Codex 호환 예외)
 
 다른 프로젝트 에이전트는 이 포트대를 피해서 사용해야 합니다.
+단, OpenAI GUI OAuth는 현재 Codex 호환을 위해 `1455` loopback callback을 사용합니다.
 
 ## 구조
 
@@ -56,9 +57,9 @@ export OPENAI_OAUTH_CLIENT_ID="your-openai-oauth-client-id"
 선택 환경변수:
 
 ```bash
-export OPENAI_OAUTH_REDIRECT_URI="http://localhost:7500/auth/callback"
+export OPENAI_OAUTH_REDIRECT_URI="http://localhost:1455/auth/callback"
 export FRONTEND_APP_URL="http://127.0.0.1:7400"
-export OPENAI_OAUTH_LOOPBACK_PORT="7500"
+export OPENAI_OAUTH_LOOPBACK_PORT="1455"
 export SESSION_SECRET="replace-this-in-real-use"
 export OPENAI_API_KEY="your-openai-api-key"
 export MCP_REGISTRY_URL="http://127.0.0.1:7100/registry/mcps"
@@ -70,7 +71,7 @@ export PLANNER_MCP_URL="http://127.0.0.1:7200/planner/plan"
 주의:
 
 - `OPENAI_OAUTH_REDIRECT_URI`는 OAuth redirect URI와 정확히 일치해야 합니다.
-- 기본값은 OpenClaw/Codex CLI 스타일 loopback callback인 `http://localhost:7500/auth/callback`입니다.
+- 기본값은 OpenClaw/Codex CLI 스타일 loopback callback인 `http://localhost:1455/auth/callback`입니다.
 - 로그인 중간 상태(`state`, `code_verifier`)도 loopback callback 호환을 위해 로컬 상태 파일에 보관합니다.
 - 실제 세션 유지는 `~/.nicecodex/agent/auth-profiles.json`에 저장된 인증 프로필을 기준으로 이뤄집니다.
 - 로그아웃은 현재 활성 프로필을 저장소에서 제거합니다.

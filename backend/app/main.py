@@ -188,7 +188,7 @@ DEFAULT_MCP_CATALOG = [
 
 OPENAI_OAUTH_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
 OPENAI_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
-OPENAI_OAUTH_SCOPES = "openid profile email offline_access"
+OPENAI_OAUTH_SCOPES = "openid profile email offline_access api.connectors.read api.connectors.invoke"
 STATE_DIR = Path(os.getenv("NICECODEX_STATE_DIR", str(Path.home() / ".nicecodex")))
 AGENT_DIR = STATE_DIR / "agent"
 SOUL_PATH = PROJECT_ROOT / "soul.md"
@@ -197,7 +197,7 @@ AUTH_PROFILES_LOCK_PATH = AGENT_DIR / "auth-profiles.lock"
 PENDING_OAUTH_PATH = AGENT_DIR / "pending-oauth.json"
 PENDING_OAUTH_LOCK_PATH = AGENT_DIR / "pending-oauth.lock"
 LOOPBACK_CALLBACK_HOST = os.getenv("OPENAI_OAUTH_LOOPBACK_HOST", "localhost")
-LOOPBACK_CALLBACK_PORT = int(os.getenv("OPENAI_OAUTH_LOOPBACK_PORT", "7500"))
+LOOPBACK_CALLBACK_PORT = int(os.getenv("OPENAI_OAUTH_LOOPBACK_PORT", "1455"))
 
 app = FastAPI(title="JARVIS API")
 
@@ -468,6 +468,7 @@ def openai_oauth_start(request: Request) -> RedirectResponse:
         "code_challenge_method": "S256",
         "id_token_add_organizations": "true",
         "codex_cli_simplified_flow": "true",
+        "originator": "codex_cli_rs",
     }
 
     return RedirectResponse(url=f"{OPENAI_OAUTH_AUTHORIZE_URL}?{urlencode(params)}", status_code=302)
@@ -578,7 +579,11 @@ def auth_logout(request: Request) -> AuthStatusResponse:
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
-    _ = request
+    try:
+        get_active_openai_credential(request)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
     model = os.getenv("CODEX_CHAT_MODEL", "default")
     message = payload.message.strip()
     mcps = load_mcp_catalog()

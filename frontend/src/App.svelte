@@ -40,6 +40,7 @@
   let previousResponseId = null;
   let commandInputRef;
   let mcpSocket;
+  $: canSubmit = authStatus.authenticated && !chatBusy;
 
   $: selectedMcp = mcps.find((mcp) => mcp.id === selectedMcpId) ?? mcps[0];
   $: activeTask = tasks.find((task) => task.status === "in_progress") ?? tasks[0];
@@ -67,6 +68,11 @@
 
   async function submitCommand() {
     const trimmed = command.trim();
+    if (!authStatus.authenticated) {
+      addMessage("system", "OpenAI 로그인 후에만 질문을 보낼 수 있습니다.");
+      await focusComposer();
+      return;
+    }
     if (!trimmed || chatBusy) return;
 
     addMessage("user", trimmed);
@@ -466,12 +472,14 @@
         <textarea
           bind:value={command}
           bind:this={commandInputRef}
-          disabled={chatBusy}
+          disabled={!authStatus.authenticated || chatBusy}
           on:keydown={handleComposerKeydown}
           rows="3"
-          placeholder="예: 새 랜딩 페이지를 만들고, API 연동 전까지는 목업 데이터로 검증해."
+          placeholder={authStatus.authenticated
+            ? "예: 새 랜딩 페이지를 만들고, API 연동 전까지는 목업 데이터로 검증해."
+            : "OpenAI 로그인 후 질문을 입력할 수 있습니다."}
         ></textarea>
-        <button class:pulse={chatBusy} class="primary-button" disabled={chatBusy} type="submit">
+        <button class:pulse={chatBusy} class="primary-button" disabled={!canSubmit} type="submit">
           {chatBusy ? "처리 중..." : "질문 보내기"}
         </button>
       </form>
