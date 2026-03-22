@@ -1,24 +1,26 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
+"""MCP registry를 조회/추가/활성화하는 전용 서비스."""
+
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-MCP_REGISTRY_PATH = PROJECT_ROOT / "backend" / "app" / "mcp_registry.json"
+from app.sqlite_store import create_registry_entry, list_registry_entries, update_registry_enabled
 
 app = FastAPI(title="JARVIS MCP Registry")
 
 
 class RegistryEntryUpdate(BaseModel):
+    """레지스트리 항목의 활성 상태 변경 요청."""
+
     enabled: bool
 
 
 class RegistryEntryCreate(BaseModel):
+    """신규 MCP 레지스트리 항목 생성 요청."""
+
     id: str
     name: str
     scope: str
@@ -32,52 +34,31 @@ class RegistryEntryCreate(BaseModel):
     auth_required: bool = False
     risk_level: str = "low"
     enabled: bool = True
-
-
-def load_registry_entries() -> List[Dict[str, Any]]:
-    try:
-        raw = json.loads(MCP_REGISTRY_PATH.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=500, detail="Registry file is missing.") from exc
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=500, detail="Registry file is invalid JSON.") from exc
-
-    if not isinstance(raw, list):
-        raise HTTPException(status_code=500, detail="Registry file must contain a list.")
-    return raw
-
-
-def save_registry_entries(entries: List[Dict[str, Any]]) -> None:
-    MCP_REGISTRY_PATH.write_text(json.dumps(entries, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
 @app.get("/health")
 def health_check() -> Dict[str, str]:
+    """레지스트리 서버 상태를 반환한다."""
     return {"status": "ok"}
 
 
 @app.get("/registry/mcps")
 def list_mcps() -> List[Dict[str, Any]]:
-    return load_registry_entries()
+    """저장된 MCP 레지스트리 전체를 반환한다."""
+    return list_registry_entries()
 
 
 @app.post("/registry/mcps")
 def create_mcp(entry: RegistryEntryCreate) -> Dict[str, Any]:
-    entries = load_registry_entries()
-    if any(item.get("id") == entry.id for item in entries):
-        raise HTTPException(status_code=409, detail="MCP id already exists.")
-    payload = entry.model_dump()
-    entries.append(payload)
-    save_registry_entries(entries)
-    return payload
+    """새 MCP 레지스트리 항목을 생성한다."""
+    try:
+        return create_registry_entry(entry.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.patch("/registry/mcps/{mcp_id}")
 def update_mcp(mcp_id: str, payload: RegistryEntryUpdate) -> Dict[str, Any]:
-    entries = load_registry_entries()
-    for item in entries:
-        if item.get("id") == mcp_id:
-            item["enabled"] = payload.enabled
-            save_registry_entries(entries)
-            return item
-    raise HTTPException(status_code=404, detail="MCP not found.")
+    """레지스트리 항목의 활성/비활성 상태를 변경한다."""
+    try:
+        return update_registry_enabled(mcp_id, payload.enabled)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc

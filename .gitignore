@@ -2,6 +2,11 @@ __pycache__/
 .DS_Store
 .playwright-cli/
 backend/.venv/
+backend/.venv-py39-backup/
 backend/.env
+data/jarvis.db
+data/jarvis.db-shm
+data/jarvis.db-wal
 frontend/node_modules/
 frontend/dist/
+mcp-runtime/node_modules/
