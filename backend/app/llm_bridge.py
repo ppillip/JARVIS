@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-"""런타임과 서비스가 공통으로 사용하는 LLM Bridge 클라이언트."""
+"""런타임과 서비스가 공통으로 사용하는 LLM Bridge 클라이언트.
+
+planner, classifier, 일반 채팅이 인증 방식을 직접 알지 않도록,
+브리지 서버에 대한 공통 호출 인터페이스를 제공한다.
+"""
 
 import json
 import os

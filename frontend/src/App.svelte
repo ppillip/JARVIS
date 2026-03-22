@@ -19,14 +19,9 @@
   let tasks = [];
   let executionLog = [];
   let executionReport = null;
-  let chatMessages = [
-      {
-        type: "bot",
-        text: "자비스 준비 완료. OpenAI 로그인 후 지령을 입력하면 플랜을 먼저 제안하고, 승인 후에만 실행 태스크를 확정합니다.",
-      },
-  ];
+  let timelineEvents = [];
   let mcps = [];
-  let selectedMcpId = "planner";
+  let selectedMcpId = "filesystem";
   let activeSideTab = "detail";
   let mcpSidebarOpen = false;
   let runTimer;
@@ -39,7 +34,11 @@
   };
   let authBusy = false;
   let chatBusy = false;
+  let liveStatusText = "";
   let previousResponseId = null;
+  let currentRunId = null;
+  let traceEvents = [];
+  let tracePanelOpen = false;
   let commandInputRef;
   let chatLogRef;
   let mcpSocket;
@@ -69,21 +68,39 @@
     disconnectMcpSocket();
   });
 
-  $: if (chatMessages.length || executionLog.length || executionReport || tasks.length || plan) {
+  $: activeWorkflowSequence =
+    [...timelineEvents].reverse().find((item) => item.event_type === "workflow_snapshot")?.sequence_no ?? null;
+
+  $: if (timelineEvents.length || executionLog.length || executionReport || tasks.length || plan) {
     scrollChatToBottom();
+  }
+
+  function appendOptimisticEvent(event_type, payload) {
+    const nextSequence = (timelineEvents.at(-1)?.sequence_no ?? 0) + 1;
+    timelineEvents = [
+      ...timelineEvents,
+      {
+        id: `optimistic-${Date.now()}-${nextSequence}`,
+        conversation_id: "pending",
+        sequence_no: nextSequence,
+        event_type,
+        payload,
+        created_at: new Date().toISOString(),
+      },
+    ];
   }
 
   async function submitCommand() {
     const trimmed = command.trim();
     if (!authStatus.authenticated) {
-      addMessage("system", "OpenAI 로그인 후에만 질문을 보낼 수 있습니다.");
       await focusComposer();
       return;
     }
     if (!trimmed || chatBusy) return;
 
-    addMessage("user", trimmed);
     chatBusy = true;
+    liveStatusText = "지령을 분석하고 플랜 가능 여부를 판단하는 중입니다.";
+    appendOptimisticEvent("user_message", { text: trimmed });
     try {
       const response = await postJson("/api/chat", {
         message: trimmed,
@@ -92,6 +109,7 @@
       });
       previousResponseId = response.response_id;
       if (response.mode === "plan" && response.workflow) {
+        liveStatusText = "MCP-aware 플랜 초안을 정리하고 있습니다.";
         currentCommand = trimmed;
         revisionCount = 0;
         phase = response.workflow.phase;
@@ -100,16 +118,19 @@
         tasks = response.workflow.tasks;
         executionLog = [];
         executionReport = null;
+        currentRunId = response.workflow.run_id ?? null;
+        traceEvents = response.workflow.trace ?? [];
         mcps = response.workflow.mcps;
         activeSideTab = "detail";
         selectedMcpId = response.workflow.plan?.proposed_tasks?.[0]?.recommended_mcp_ids?.[0] ?? selectedMcpId;
       }
-      addMessage("bot", response.reply);
+      await refreshTimeline();
       command = "";
     } catch (error) {
-      addMessage("system", error.message ?? "질문 처리 중 오류가 발생했습니다.");
+      console.error(error);
     } finally {
       chatBusy = false;
+      liveStatusText = "";
       await focusComposer();
     }
   }
@@ -118,54 +139,69 @@
     if (!plan?.proposed_tasks?.length) return;
 
     revisionCount += 1;
-    addMessage("user", "플랜을 더 구체적으로 다듬어라.");
+    chatBusy = true;
+    liveStatusText = "기존 플랜을 재검토하고 더 구체적인 실행안으로 다듬는 중입니다.";
+    appendOptimisticEvent("system_message", { text: `플랜 수정 요청 ${revisionCount}회를 반영 중입니다.` });
 
-    const response = await postJson("/api/review", {
-      command: currentCommand,
-      revision_count: revisionCount,
-    });
+    try {
+      const response = await postJson("/api/review", {
+        command: currentCommand,
+        revision_count: revisionCount,
+      });
 
-    plan = response.plan;
-    tasks = [];
-    executionLog = [];
-    executionReport = null;
-    phase = response.phase;
-    approval = response.approval;
-    mcps = response.mcps;
-    addMessage("bot", response.message);
+      plan = response.plan;
+      tasks = [];
+      executionLog = [];
+      executionReport = null;
+      currentRunId = response.run_id ?? null;
+      traceEvents = response.trace ?? [];
+      phase = response.phase;
+      approval = response.approval;
+      mcps = response.mcps;
+      await refreshTimeline();
+    } finally {
+      chatBusy = false;
+      liveStatusText = "";
+    }
   }
 
   async function approvePlan() {
     if (!plan?.proposed_tasks?.length) return;
 
     chatBusy = true;
-    const response = await postJson("/api/approve", { plan });
+    liveStatusText = "플랜 승인을 반영하고 실행 가능한 태스크로 변환하는 중입니다.";
+    appendOptimisticEvent("system_message", { text: "플랜 승인을 처리 중입니다." });
+    const response = await postJson("/api/approve", { plan, run_id: currentRunId });
     tasks = response.tasks;
+    currentRunId = response.run_id ?? currentRunId;
+    traceEvents = response.trace ?? [];
     phase = "executing";
     approval = response.approval;
     mcps = response.mcps;
     executionLog = [];
     executionReport = null;
-    addMessage("system", "플랜 승인이 기록되었습니다.");
     activeSideTab = "routing";
     selectedMcpId = response.tasks[0]?.mcp_ids?.[0] ?? selectedMcpId;
+    await refreshTimeline();
     try {
-      const execution = await postJson("/api/execute", { tasks: response.tasks });
+      liveStatusText = "승인된 태스크를 순차 실행하고 증적을 수집하는 중입니다.";
+      appendOptimisticEvent("system_message", { text: "실행 중입니다." });
+      const execution = await postJson("/api/execute", { run_id: currentRunId, tasks: response.tasks });
       tasks = execution.tasks;
       executionLog = execution.execution_log;
       executionReport = execution.execution_report;
+      currentRunId = execution.run_id ?? currentRunId;
+      traceEvents = execution.trace ?? [];
       phase = execution.phase;
-      addMessage("system", "실행 완료. 결과를 보고합니다.");
+      liveStatusText = "실행 결과를 정리해 보고서를 만드는 중입니다.";
+      await refreshTimeline();
     } catch (error) {
-      addMessage("system", error.message ?? "실행 중 오류가 발생했습니다.");
+      console.error(error);
     } finally {
       chatBusy = false;
+      liveStatusText = "";
       await focusComposer();
     }
-  }
-
-  function addMessage(type, text) {
-    chatMessages = [...chatMessages, { type, text }];
   }
 
   function escapeHtml(value) {
@@ -235,12 +271,12 @@
   }
 
   function buildConversationContext() {
-    return chatMessages
-      .filter((item) => item.type === "user" || item.type === "bot" || item.type === "system")
+    return timelineEvents
+      .filter((item) => item.event_type === "user_message" || item.event_type === "assistant_message" || item.event_type === "system_message")
       .slice(-12)
       .map((item) => ({
-        role: item.type === "bot" ? "assistant" : item.type,
-        content: item.text,
+        role: item.event_type === "assistant_message" ? "assistant" : item.event_type === "user_message" ? "user" : "system",
+        content: item.payload.text,
       }));
   }
 
@@ -264,24 +300,13 @@
     return data;
   }
 
-  function formatExecutionReportMessage(report) {
-    const findings = (report?.findings ?? []).slice(0, 2).map((item) => `- ${item}`).join("\n");
-    const resultItems = (report?.result_items ?? []).map((item) => `- ${item}`).join("\n");
-
-    return [
-      report.summary,
-      "",
-      resultItems ? "결과 목록" : "핵심 결과",
-      resultItems || findings || "- 없음",
-      ...(resultItems ? ["", "요약", findings || "- 없음"] : []),
-    ].join("\n");
-  }
-
-  function resetSession() {
+  async function resetSession() {
+    await postJson("/api/conversation/reset", {});
     stopRunTimer();
     command = "";
     currentCommand = "";
     previousResponseId = null;
+    currentRunId = null;
     phase = "idle";
     approval = "pending";
     revisionCount = 0;
@@ -289,18 +314,23 @@
     tasks = [];
     executionLog = [];
     executionReport = null;
+    traceEvents = [];
+    tracePanelOpen = false;
     activeSideTab = "detail";
-    selectedMcpId = "planner";
-    chatMessages = [
-      {
-        type: "bot",
-        text: "세션을 초기화했습니다. 새 지령을 입력하면 같은 승인 기반 워크플로우로 다시 시작합니다.",
-      },
-    ];
+    selectedMcpId = "filesystem";
+    timelineEvents = [];
   }
 
   function formatMcpNames(ids) {
     return (ids ?? []).map((id) => mcps.find((mcp) => mcp.id === id)?.name ?? id).join(", ");
+  }
+
+  function formatTraceEvent(entry) {
+    const detail = Object.entries(entry ?? {})
+      .filter(([key]) => key !== "event")
+      .map(([key, value]) => `${key}=${typeof value === "string" ? value : JSON.stringify(value)}`)
+      .join(" | ");
+    return detail ? `${entry.event} | ${detail}` : entry.event;
   }
 
   function stopRunTimer() {
@@ -320,7 +350,7 @@
         if (payload.type === "mcps_updated" && Array.isArray(payload.mcps)) {
           mcps = payload.mcps;
           if (!payload.mcps.some((mcp) => mcp.id === selectedMcpId)) {
-            selectedMcpId = payload.mcps[0]?.id ?? "planner";
+            selectedMcpId = payload.mcps[0]?.id ?? "filesystem";
           }
         }
       } catch (_error) {
@@ -388,11 +418,44 @@
 
     mcps = await mcpResponse.json();
     authStatus = await authResponse.json();
+    await refreshTimeline();
   }
 
   async function refreshAuthStatus() {
     const response = await fetch("/api/auth/status", { credentials: "include" });
     authStatus = await response.json();
+  }
+
+  async function refreshTimeline() {
+    const response = await fetch("/api/conversation/events", { credentials: "include" });
+    timelineEvents = await response.json();
+    hydrateCurrentWorkflow();
+  }
+
+  function hydrateCurrentWorkflow() {
+    const latestWorkflow = [...timelineEvents].reverse().find((item) => item.event_type === "workflow_snapshot");
+    if (!latestWorkflow) {
+      phase = "idle";
+      approval = "pending";
+      plan = null;
+      tasks = [];
+      executionLog = [];
+      executionReport = null;
+      traceEvents = [];
+      currentRunId = null;
+      tracePanelOpen = false;
+      return;
+    }
+
+    const snapshot = latestWorkflow.payload;
+    phase = snapshot.phase ?? "idle";
+    approval = snapshot.approval ?? "pending";
+    plan = snapshot.plan;
+    tasks = snapshot.tasks ?? [];
+    executionLog = snapshot.executionLog ?? [];
+    executionReport = snapshot.executionReport ?? null;
+    traceEvents = snapshot.traceEvents ?? [];
+    currentRunId = snapshot.currentRunId ?? null;
   }
 
 </script>
@@ -475,129 +538,170 @@
       </header>
 
         <div class="chat-log" bind:this={chatLogRef}>
-        {#each chatMessages as item}
-          <div class={`message ${item.type}`}>
-            <div class="message-content">{@html renderMarkdown(item.text)}</div>
+        {#if !timelineEvents.length}
+          <div class="message bot">
+            <div class="message-content">
+              {@html renderMarkdown("자비스 준비 완료. OpenAI 로그인 후 지령을 입력하면 플랜을 먼저 제안하고, 승인 후에만 실행 태스크를 확정합니다.")}
+            </div>
           </div>
-        {/each}
-
-        {#if plan}
-          <article class="workflow-entry workflow-message">
-            <div class="card-title-row">
-              <h3>플랜</h3>
-              <span class="badge">1개</span>
-            </div>
-            <p><strong>{plan.summary}</strong></p>
-            <div class="task-meta"><strong>목표</strong></div>
-            <p>{plan.objective}</p>
-            <div class="task-meta"><strong>제안 태스크</strong></div>
-            <ul class="item-list">
-              {#each plan.proposed_tasks as task}
-                <li>
-                  <strong>{task.title}</strong>
-                  {#if task.recommended_mcp_ids?.length}
-                    <div class="task-meta">추천 MCP: {formatMcpNames(task.recommended_mcp_ids)}</div>
-                  {/if}
-                  {#if task.expected_result}
-                    <div class="task-meta">예상 결과: {task.expected_result}</div>
-                  {/if}
-                  {#if task.rationale}
-                    <div class="task-meta">{task.rationale}</div>
-                  {/if}
-                </li>
-              {/each}
-            </ul>
-          </article>
         {/if}
+        {#each timelineEvents as item}
+          {#if item.event_type === "workflow_snapshot"}
+            <article class="workflow-entry workflow-message">
+              {#if item.payload.plan}
+                <div class="card-title-row">
+                  <h3>플랜</h3>
+                  <span class="badge">1개</span>
+                </div>
+                <p><strong>{item.payload.plan.summary}</strong></p>
+                {#if item.payload.plan.strategy?.applied}
+                  <section class="strategy-panel">
+                    <div class="card-title-row">
+                      <h4>Sequential Thinking</h4>
+                      <span class="badge">ST 개입됨</span>
+                    </div>
+                    {#if item.payload.plan.strategy.reason}
+                      <div class="task-meta"><strong>개입 이유</strong></div>
+                      <p>{item.payload.plan.strategy.reason}</p>
+                    {/if}
+                    {#if item.payload.plan.strategy.summary}
+                      <div class="task-meta"><strong>전략 요약</strong></div>
+                      <p>{item.payload.plan.strategy.summary}</p>
+                    {/if}
+                  </section>
+                {/if}
+                <div class="task-meta"><strong>목표</strong></div>
+                <p>{item.payload.plan.objective}</p>
+                <div class="task-meta"><strong>제안 태스크</strong></div>
+                <ul class="item-list">
+                  {#each item.payload.plan.proposed_tasks as task}
+                    <li>
+                      <strong>{task.title}</strong>
+                      {#if task.recommended_mcp_ids?.length}
+                        <div class="task-meta">추천 MCP: {formatMcpNames(task.recommended_mcp_ids)}</div>
+                      {/if}
+                      {#if task.expected_result}
+                        <div class="task-meta">예상 결과: {task.expected_result}</div>
+                      {/if}
+                      {#if task.rationale}
+                        <div class="task-meta">{task.rationale}</div>
+                      {/if}
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
 
-        {#if plan}
-          <article class="workflow-entry workflow-message compact">
-            <div class="card-title-row">
-              <h3>검토</h3>
-              <span class="badge">{approval === "approved" ? "승인됨" : "검토 필요"}</span>
-            </div>
-            <div class="review-actions inline">
-              <button class="primary-button" disabled={!plan?.proposed_tasks?.length || approval === "approved"} on:click={approvePlan}>플랜 승인</button>
-              <button class="ghost-button" disabled={!plan?.proposed_tasks?.length || approval === "approved"} on:click={revisePlan}>수정 요청</button>
-            </div>
-          </article>
-        {/if}
-
-        {#if tasks.length}
-          <article class="workflow-entry workflow-message">
-            <div class="card-title-row">
-              <h3>실행 태스크</h3>
-              <span class="badge">{tasks.filter((task) => task.status === "done").length}/{tasks.length}</span>
-            </div>
-            <ol class="item-list">
-              {#each tasks as task}
-                <li>
-                  <strong>{task.title}</strong>
-                  <div class="task-meta">사용 MCP: {formatMcpNames(task.mcp_ids)}</div>
-                  <div class="task-meta">
-                    상태: {task.status === "done" ? "완료" : task.status === "in_progress" ? "진행 중" : "대기"}
+              {#if item.payload.plan}
+                <article class="workflow-entry workflow-message compact embedded-workflow">
+                  <div class="card-title-row">
+                    <h3>검토</h3>
+                    <span class="badge">{item.payload.approval === "approved" ? "승인됨" : "검토 필요"}</span>
                   </div>
-                </li>
-              {/each}
-            </ol>
-          </article>
-        {/if}
+                  {#if item.sequence_no === activeWorkflowSequence && item.payload.approval !== "approved"}
+                    <div class="review-actions inline">
+                      <button class="primary-button" disabled={!plan?.proposed_tasks?.length || approval === "approved"} on:click={approvePlan}>플랜 승인</button>
+                      <button class="ghost-button" disabled={!plan?.proposed_tasks?.length || approval === "approved"} on:click={revisePlan}>수정 요청</button>
+                    </div>
+                  {/if}
+                </article>
+              {/if}
 
-        {#if executionLog.length}
-          <article class="workflow-entry workflow-message">
-            <div class="card-title-row">
-              <h3>실행 로그</h3>
-              <span class="badge">{phase === "executing" ? "진행 중" : phase === "completed" ? "완료" : "정지"}</span>
-            </div>
-            <ul class="item-list">
-              {#each executionLog as entry}
-                <li>{entry}</li>
-              {/each}
-            </ul>
-          </article>
-        {/if}
+              {#if item.payload.tasks?.length}
+                <div class="card-title-row">
+                  <h3>실행 태스크</h3>
+                  <span class="badge">{item.payload.tasks.filter((task) => task.status === "done").length}/{item.payload.tasks.length}</span>
+                </div>
+                <ol class="item-list">
+                  {#each item.payload.tasks as task}
+                    <li>
+                      <strong>{task.title}</strong>
+                      <div class="task-meta">사용 MCP: {formatMcpNames(task.mcp_ids)}</div>
+                      <div class="task-meta">상태: {task.status === "done" ? "완료" : task.status === "in_progress" ? "진행 중" : "대기"}</div>
+                    </li>
+                  {/each}
+                </ol>
+              {/if}
 
-        {#if executionReport}
-          <article class="workflow-entry workflow-message">
-            <div class="card-title-row">
-              <h3>보고</h3>
-              <span class="badge">{executionReport.status}</span>
+              {#if item.payload.executionLog?.length}
+                <div class="card-title-row">
+                  <h3>실행 로그</h3>
+                  <span class="badge">{item.payload.phase === "completed" ? "완료" : item.payload.phase}</span>
+                </div>
+                <ul class="item-list">
+                  {#each item.payload.executionLog as entry}
+                    <li>{entry}</li>
+                  {/each}
+                </ul>
+              {/if}
+
+              {#if item.payload.executionReport}
+                <div class="card-title-row">
+                  <h3>보고</h3>
+                  <span class="badge">{item.payload.executionReport.status}</span>
+                </div>
+                <p><strong>{item.payload.executionReport.summary}</strong></p>
+                {#if item.payload.executionReport.result_items?.length}
+                  <div class="task-meta"><strong>결과 목록</strong></div>
+                  <ul class="item-list">
+                    {#each item.payload.executionReport.result_items as resultItem}
+                      <li>{resultItem}</li>
+                    {/each}
+                  </ul>
+                {/if}
+                <div class="task-meta"><strong>발견 사항</strong></div>
+                <ul class="item-list">
+                  {#each item.payload.executionReport.findings as finding}
+                    <li>{finding}</li>
+                  {/each}
+                </ul>
+                <div class="task-meta"><strong>결론</strong></div>
+                <p>{item.payload.executionReport.conclusion}</p>
+                <div class="task-meta"><strong>실행 근거</strong></div>
+                <ul class="item-list compact-list">
+                  {#each item.payload.executionReport.evidence as evidence}
+                    <li>{evidence}</li>
+                  {/each}
+                </ul>
+              {/if}
+
+              {#if item.sequence_no === activeWorkflowSequence && item.payload.traceEvents?.length}
+                <article class="workflow-entry workflow-message compact embedded-workflow">
+                  <div class="card-title-row">
+                    <h3>운영 Trace</h3>
+                    <span class="badge">{item.payload.traceEvents.length}개</span>
+                  </div>
+                  <div class="review-actions inline">
+                    <button class="ghost-button" on:click={() => (tracePanelOpen = !tracePanelOpen)}>
+                      {tracePanelOpen ? "Trace 닫기" : "Trace 열기"}
+                    </button>
+                    {#if item.payload.currentRunId}
+                      <span class="task-meta">run_id: {item.payload.currentRunId}</span>
+                    {/if}
+                  </div>
+                  {#if tracePanelOpen}
+                    <ul class="item-list compact-list trace-list">
+                      {#each item.payload.traceEvents as traceEntry}
+                        <li><code>{formatTraceEvent(traceEntry)}</code></li>
+                      {/each}
+                    </ul>
+                  {/if}
+                </article>
+              {/if}
+            </article>
+          {:else}
+            <div class={`message ${item.event_type === "assistant_message" ? "bot" : item.event_type === "user_message" ? "user" : "system"}`}>
+              <div class="message-content">{@html renderMarkdown(item.payload.text)}</div>
             </div>
-            <p><strong>{executionReport.summary}</strong></p>
-            <div class="task-meta"><strong>보고 목적</strong></div>
-            <p>{executionReport.objective}</p>
-            <div class="task-meta"><strong>수행한 태스크</strong></div>
-            <ul class="item-list">
-              {#each executionReport.tasks as task}
-                <li>{task}</li>
-              {/each}
-            </ul>
-            {#if executionReport.result_items?.length}
-              <div class="task-meta"><strong>결과 목록</strong></div>
-              <ul class="item-list">
-                {#each executionReport.result_items as item}
-                  <li>{item}</li>
-                {/each}
-              </ul>
-            {/if}
-            <div class="task-meta"><strong>발견 사항</strong></div>
-            <ul class="item-list">
-              {#each executionReport.findings as finding}
-                <li>{finding}</li>
-              {/each}
-            </ul>
-            <div class="task-meta"><strong>결론</strong></div>
-            <p>{executionReport.conclusion}</p>
-            <div class="task-meta"><strong>실행 근거</strong></div>
-            <ul class="item-list compact-list">
-              {#each executionReport.evidence as evidence}
-                <li>{evidence}</li>
-              {/each}
-            </ul>
-            <div class="task-meta">{executionReport.nextAction}</div>
-          </article>
-        {/if}
+          {/if}
+        {/each}
       </div>
+
+      {#if chatBusy && liveStatusText}
+        <div class="live-status-panel">
+          <span class="live-status-label">현재 처리 중</span>
+          <strong>{liveStatusText}</strong>
+        </div>
+      {/if}
 
       <div class="workflow-status-bar">
         <span class="status-pill">단계: {phaseLabels[phase] ?? phase}</span>

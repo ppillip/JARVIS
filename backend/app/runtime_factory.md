@@ -5,5 +5,6 @@
 - `JARVIS_AGENT_RUNTIME` 환경변수 기준 선택
 - `classic`
 - `deepagents`
+- `sequential`
 
 현재 런타임 전환의 단일 선택 지점입니다.

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-"""Deep Agents 경계를 제공하되, 실패 시 classic runtime으로 폴백한다."""
+"""Deep Agents 연동 경계와 호환 계층.
+
+Deep Agents 라이브러리와 JARVIS 내부 구조 사이의 연결 지점을 제공하며,
+필요 시 classic 경로와의 호환을 유지한다.
+"""
 
 import json
 import os

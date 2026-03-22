@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-"""MCP registry를 조회/추가/활성화하는 전용 서비스."""
+"""MCP registry를 조회/추가/활성화하는 전용 서비스.
+
+실행 가능한 MCP 목록의 source of truth를 별도 서비스로 유지해,
+메인 백엔드와 관리자 UI가 같은 registry를 참조하게 한다.
+"""
 
 from typing import Any, Dict, List, Optional
 

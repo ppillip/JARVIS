@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-"""JARVIS의 MCP registry와 Prompt DB를 저장하는 SQLite 접근 계층."""
+"""JARVIS의 SQLite 저장 계층.
+
+MCP registry, prompts, workflow runs, trace, conversation timeline을
+하나의 SQLite 저장소에 유지하는 공통 persistence 계층이다.
+"""
 
 import json
 import sqlite3
@@ -68,6 +72,38 @@ def create_tables(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             PRIMARY KEY (prompt_id, version),
             FOREIGN KEY (prompt_id) REFERENCES prompt_definitions(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS workflow_runs (
+            id TEXT PRIMARY KEY,
+            command_text TEXT,
+            phase TEXT NOT NULL,
+            planner_type TEXT,
+            fallback_used INTEGER NOT NULL DEFAULT 0,
+            plan_json TEXT,
+            tasks_json TEXT,
+            report_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS workflow_trace_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            sequence_no INTEGER NOT NULL,
+            event TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (run_id) REFERENCES workflow_runs(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS conversation_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL,
+            sequence_no INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
         );
         """
     )
@@ -463,3 +499,220 @@ def delete_prompt_entry(prompt_id: str) -> Dict[str, Any]:
         if cursor.rowcount == 0:
             raise KeyError("Prompt not found.")
     return current
+
+
+def upsert_workflow_run(
+    run_id: str,
+    *,
+    phase: str,
+    command_text: Optional[str] = None,
+    planner_type: Optional[str] = None,
+    fallback_used: bool = False,
+    plan: Optional[Dict[str, Any]] = None,
+    tasks: Optional[List[Dict[str, Any]]] = None,
+    report: Optional[Dict[str, Any]] = None,
+) -> None:
+    """워크플로우 실행 단위의 최신 스냅샷을 저장한다."""
+    initialize_database()
+    timestamp = now_iso()
+    with connect() as conn:
+        existing = conn.execute("SELECT id FROM workflow_runs WHERE id = ?", (run_id,)).fetchone()
+        payload = (
+            command_text,
+            phase,
+            planner_type,
+            1 if fallback_used else 0,
+            json.dumps(plan, ensure_ascii=False) if plan is not None else None,
+            json.dumps(tasks, ensure_ascii=False) if tasks is not None else None,
+            json.dumps(report, ensure_ascii=False) if report is not None else None,
+            timestamp,
+            run_id,
+        )
+        if existing:
+            conn.execute(
+                """
+                UPDATE workflow_runs
+                SET command_text = COALESCE(?, command_text),
+                    phase = ?,
+                    planner_type = COALESCE(?, planner_type),
+                    fallback_used = ?,
+                    plan_json = COALESCE(?, plan_json),
+                    tasks_json = COALESCE(?, tasks_json),
+                    report_json = COALESCE(?, report_json),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                payload,
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO workflow_runs (
+                    id, command_text, phase, planner_type, fallback_used,
+                    plan_json, tasks_json, report_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    command_text,
+                    phase,
+                    planner_type,
+                    1 if fallback_used else 0,
+                    json.dumps(plan, ensure_ascii=False) if plan is not None else None,
+                    json.dumps(tasks, ensure_ascii=False) if tasks is not None else None,
+                    json.dumps(report, ensure_ascii=False) if report is not None else None,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        conn.commit()
+
+
+def replace_workflow_trace(run_id: str, trace: List[Dict[str, Any]]) -> None:
+    """주어진 run의 trace 이벤트를 순서대로 교체 저장한다."""
+    initialize_database()
+    timestamp = now_iso()
+    with connect() as conn:
+        conn.execute("DELETE FROM workflow_trace_events WHERE run_id = ?", (run_id,))
+        for index, item in enumerate(trace, start=1):
+            conn.execute(
+                """
+                INSERT INTO workflow_trace_events (run_id, sequence_no, event, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    index,
+                    str(item.get("event", "unknown")),
+                    json.dumps(item, ensure_ascii=False),
+                    timestamp,
+                ),
+            )
+        conn.commit()
+
+
+def get_workflow_run(run_id: str) -> Optional[Dict[str, Any]]:
+    """저장된 단일 워크플로우 실행 스냅샷과 trace를 반환한다."""
+    initialize_database()
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id, command_text, phase, planner_type, fallback_used,
+                   plan_json, tasks_json, report_json, created_at, updated_at
+            FROM workflow_runs
+            WHERE id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        if not row:
+            return None
+        trace_rows = conn.execute(
+            """
+            SELECT payload_json
+            FROM workflow_trace_events
+            WHERE run_id = ?
+            ORDER BY sequence_no ASC
+            """,
+            (run_id,),
+        ).fetchall()
+    return {
+        "id": row["id"],
+        "command_text": row["command_text"],
+        "phase": row["phase"],
+        "planner_type": row["planner_type"],
+        "fallback_used": bool(row["fallback_used"]),
+        "plan": json.loads(row["plan_json"]) if row["plan_json"] else None,
+        "tasks": json.loads(row["tasks_json"]) if row["tasks_json"] else [],
+        "report": json.loads(row["report_json"]) if row["report_json"] else None,
+        "trace": [json.loads(item["payload_json"]) for item in trace_rows],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def list_workflow_runs(limit: int = 20) -> List[Dict[str, Any]]:
+    """최근 워크플로우 실행 목록을 최신순으로 반환한다."""
+    initialize_database()
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, command_text, phase, planner_type, fallback_used,
+                   created_at, updated_at
+            FROM workflow_runs
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "command_text": row["command_text"],
+            "phase": row["phase"],
+            "planner_type": row["planner_type"],
+            "fallback_used": bool(row["fallback_used"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+        for row in rows
+    ]
+
+
+def append_conversation_event(conversation_id: str, event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """세션 대화 타임라인에 새 이벤트를 순서대로 추가한다."""
+    initialize_database()
+    timestamp = now_iso()
+    with connect() as conn:
+        next_row = conn.execute(
+            "SELECT COALESCE(MAX(sequence_no), 0) + 1 AS next_sequence FROM conversation_events WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        sequence_no = int(next_row["next_sequence"]) if next_row else 1
+        cursor = conn.execute(
+            """
+            INSERT INTO conversation_events (conversation_id, sequence_no, event_type, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                conversation_id,
+                sequence_no,
+                event_type,
+                json.dumps(payload, ensure_ascii=False),
+                timestamp,
+            ),
+        )
+        conn.commit()
+    return {
+        "id": int(cursor.lastrowid),
+        "conversation_id": conversation_id,
+        "sequence_no": sequence_no,
+        "event_type": event_type,
+        "payload": payload,
+        "created_at": timestamp,
+    }
+
+
+def list_conversation_events(conversation_id: str) -> List[Dict[str, Any]]:
+    """세션 대화 타임라인 이벤트를 시간순으로 반환한다."""
+    initialize_database()
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, conversation_id, sequence_no, event_type, payload_json, created_at
+            FROM conversation_events
+            WHERE conversation_id = ?
+            ORDER BY sequence_no ASC, id ASC
+            """,
+            (conversation_id,),
+        ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "conversation_id": row["conversation_id"],
+            "sequence_no": row["sequence_no"],
+            "event_type": row["event_type"],
+            "payload": json.loads(row["payload_json"]),
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]

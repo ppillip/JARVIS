@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-"""OAuth/API key/local model을 하나의 OpenAI-compatible 인터페이스로 감싸는 bridge 서버."""
+"""여러 LLM provider를 OpenAI-compatible 인터페이스로 감싸는 bridge 서버.
+
+OAuth, API key, local OpenAI-compatible provider, codex fallback 같은 백엔드를
+하나의 `/v1/chat/completions` 스타일 인터페이스 뒤에 숨긴다.
+"""
 
 import asyncio
 import json

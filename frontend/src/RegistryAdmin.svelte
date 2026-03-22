@@ -4,6 +4,8 @@
   let activeTab = "registry";
   let registryEntries = [];
   let promptEntries = [];
+  let runEntries = [];
+  let selectedRun = null;
   let busy = false;
   let errorMessage = "";
   let selectedPromptId = "";
@@ -29,7 +31,7 @@
   $: selectedPrompt = promptEntries.find((entry) => entry.id === selectedPromptId) ?? promptEntries[0];
 
   onMount(async () => {
-    await Promise.all([refreshRegistryEntries(), refreshPromptEntries()]);
+    await Promise.all([refreshRegistryEntries(), refreshPromptEntries(), refreshRunEntries()]);
   });
 
   async function refreshRegistryEntries() {
@@ -42,6 +44,14 @@
     promptEntries = await response.json();
     if (!selectedPromptId && promptEntries.length) {
       loadPrompt(promptEntries[0]);
+    }
+  }
+
+  async function refreshRunEntries() {
+    const response = await fetch("/api/runs");
+    runEntries = await response.json();
+    if (!selectedRun && runEntries.length) {
+      await loadRun(runEntries[0].id);
     }
   }
 
@@ -190,6 +200,23 @@
       busy = false;
     }
   }
+
+  async function loadRun(runId) {
+    busy = true;
+    errorMessage = "";
+    try {
+      const response = await fetch(`/api/runs/${runId}`);
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail ?? "Request failed");
+      }
+      selectedRun = data;
+    } catch (error) {
+      errorMessage = error.message ?? "실행 이력 조회에 실패했습니다.";
+    } finally {
+      busy = false;
+    }
+  }
 </script>
 
 <svelte:head>
@@ -213,6 +240,9 @@
       </button>
       <button class:active={activeTab === "prompts"} class="tab-button" on:click={() => (activeTab = "prompts")}>
         Prompt DB
+      </button>
+      <button class:active={activeTab === "runs"} class="tab-button" on:click={() => (activeTab = "runs")}>
+        Runs
       </button>
     </div>
 
@@ -263,7 +293,7 @@
           </div>
         </article>
       </div>
-    {:else}
+    {:else if activeTab === "prompts"}
       <div class="admin-grid prompt-grid">
         <article class="mcp-detail-card">
           <div class="mcp-item-header">
@@ -340,6 +370,54 @@
             </div>
           {:else}
             <div class="task-meta">프롬프트를 선택하면 버전 목록이 표시됩니다.</div>
+          {/if}
+        </article>
+      </div>
+    {:else}
+      <div class="admin-grid">
+        <article class="mcp-detail-card">
+          <div class="mcp-item-header">
+            <span class="mcp-name">최근 실행</span>
+            <span class="mcp-badge">{runEntries.length}개</span>
+          </div>
+          <div class="registry-list">
+            {#each runEntries as entry}
+              <button class="prompt-list-item" on:click={() => loadRun(entry.id)}>
+                <div class="mcp-item-header">
+                  <span class="mcp-name">{entry.planner_type ?? "unknown"}</span>
+                  <span class="mcp-badge">{entry.phase}</span>
+                </div>
+                <p class="mcp-detail-copy">{entry.command_text ?? "command unavailable"}</p>
+                <div class="task-meta">run_id: {entry.id}</div>
+                <div class="task-meta">fallback: {entry.fallback_used ? "yes" : "no"}</div>
+              </button>
+            {/each}
+          </div>
+        </article>
+
+        <article class="mcp-detail-card">
+          <div class="mcp-item-header">
+            <span class="mcp-name">실행 상세</span>
+            <span class="mcp-badge">{selectedRun?.phase ?? "없음"}</span>
+          </div>
+          {#if selectedRun}
+            <p class="mcp-detail-copy">{selectedRun.command_text}</p>
+            <div class="task-meta">planner: {selectedRun.planner_type ?? "unknown"}</div>
+            <div class="task-meta">fallback: {selectedRun.fallback_used ? "yes" : "no"}</div>
+            {#if selectedRun.trace?.length}
+              <div class="task-meta"><strong>Trace</strong></div>
+              <ul class="item-list compact-list trace-list">
+                {#each selectedRun.trace as traceEntry}
+                  <li><code>{JSON.stringify(traceEntry)}</code></li>
+                {/each}
+              </ul>
+            {/if}
+            {#if selectedRun.report}
+              <div class="task-meta"><strong>Report Summary</strong></div>
+              <p class="mcp-detail-copy">{selectedRun.report.summary}</p>
+            {/if}
+          {:else}
+            <div class="task-meta">실행 이력을 선택하면 trace와 report를 볼 수 있습니다.</div>
           {/if}
         </article>
       </div>

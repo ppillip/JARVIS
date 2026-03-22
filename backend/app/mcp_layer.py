@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-"""향후 MCP adapter/skill/guardrail 일반화를 위한 추상 인터페이스."""
+"""MCP adapter/skill/guardrail 일반화를 위한 추상 인터페이스.
+
+현재는 Filesystem 중심 구현이 많지만, 장기적으로 MCP별 adapter와 skill을
+동일한 패턴으로 확장할 수 있도록 경계를 정의한다.
+"""
 
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional

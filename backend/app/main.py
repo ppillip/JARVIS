@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-"""JARVIS의 메인 FastAPI 엔드포인트와 세션/OAuth/UI용 API를 제공한다."""
+"""JARVIS의 메인 FastAPI 엔드포인트와 세션/UI/API 조립 계층.
+
+planner/executor/registry/bridge를 직접 구현하지 않고, 각 계층을 조합해
+프론트엔드가 쓰는 API와 세션, timeline 저장을 한 곳에서 제공한다.
+"""
 
 import base64
 import asyncio
@@ -14,6 +18,7 @@ import secrets
 import threading
 import time
 import tempfile
+import uuid
 from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import urlencode
 
@@ -27,19 +32,29 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 from app.agent_runtime import RuntimePlan, RuntimeTask
+from app.capability_map_service import build_capability_map
 from app.filesystem_skill import execute_filesystem_task
 from app.llm_bridge import extract_json_object, invoke_bridge_text
+from app.plan_normalizer import normalize_runtime_plan
+from app.plan_schema import NormalizedPlan, NormalizedTaskDraft, PlannerMetadata
 from app.prompt_store import get_prompt_content, render_prompt_template
-from app.runtime_factory import get_agent_runtime
+from app.runtime_factory import get_executor_runtime, get_planner_runtime
 from app.sqlite_store import (
     activate_prompt_version as activate_prompt_version_store,
+    append_conversation_event,
     append_prompt_version,
     create_prompt_entry,
     delete_prompt_entry,
+    get_workflow_run,
     initialize_database,
+    list_conversation_events,
+    list_workflow_runs,
     list_prompt_entries,
     list_registry_entries as list_registry_entries_from_db,
+    replace_workflow_trace,
+    upsert_workflow_run,
 )
+from app.task_compiler import compile_tasks, map_task_to_mcps
 
 load_dotenv()
 initialize_database()
@@ -83,11 +98,38 @@ class ProposedTask(BaseModel):
     expected_result: str = ""
 
 
+class StrategyOption(BaseModel):
+    """UI에 표시하는 전략 옵션 구조."""
+
+    name: str
+    approach: str = ""
+    tradeoffs: str = ""
+
+
+class StrategyDraft(BaseModel):
+    """Sequential Thinking이 생성한 전략 정리 UI 구조."""
+
+    applied: bool = False
+    summary: str = ""
+    recommended_strategy: str = ""
+    options: List[StrategyOption] = Field(default_factory=list)
+    risks: List[str] = Field(default_factory=list)
+    reason: str = ""
+
+
 class PlanDraft(BaseModel):
     """UI에 노출되는 단일 플랜 초안."""
 
     objective: str
     summary: str
+    assumptions: List[str] = Field(default_factory=list)
+    constraints: List[str] = Field(default_factory=list)
+    required_capabilities: List[str] = Field(default_factory=list)
+    approval_required: bool = True
+    risks: List[str] = Field(default_factory=list)
+    expected_outputs: List[str] = Field(default_factory=list)
+    planner_metadata: Dict[str, Any] = Field(default_factory=dict)
+    strategy: Optional[StrategyDraft] = None
     proposed_tasks: List[ProposedTask] = Field(default_factory=list, min_length=1)
 
 
@@ -108,6 +150,7 @@ class ApproveRequest(BaseModel):
     """승인할 플랜을 전달하는 입력 구조."""
 
     plan: PlanDraft
+    run_id: Optional[str] = None
 
 
 class ChatRequest(BaseModel):
@@ -150,11 +193,14 @@ class WorkflowResponse(BaseModel):
     plan: Optional[PlanDraft] = None
     tasks: List[TaskItem]
     mcps: List[MpcDefinition]
+    trace: List[Dict[str, Any]] = Field(default_factory=list)
+    run_id: Optional[str] = None
 
 
 class ExecuteRequest(BaseModel):
     """실행할 태스크 목록 입력 구조."""
 
+    run_id: Optional[str] = None
     tasks: List[TaskItem] = Field(default_factory=list, min_length=1)
 
 
@@ -166,6 +212,47 @@ class ExecuteResponse(BaseModel):
     tasks: List[TaskItem]
     execution_log: List[str]
     execution_report: Dict[str, Any]
+    trace: List[Dict[str, Any]] = Field(default_factory=list)
+    run_id: Optional[str] = None
+
+
+class WorkflowRunRecord(BaseModel):
+    """저장된 실행 단위의 trace/report 조회 응답 구조."""
+
+    id: str
+    command_text: Optional[str] = None
+    phase: str
+    planner_type: Optional[str] = None
+    fallback_used: bool = False
+    plan: Optional[Dict[str, Any]] = None
+    tasks: List[Dict[str, Any]] = Field(default_factory=list)
+    report: Optional[Dict[str, Any]] = None
+    trace: List[Dict[str, Any]] = Field(default_factory=list)
+    created_at: str
+    updated_at: str
+
+
+class WorkflowRunSummary(BaseModel):
+    """최근 실행 목록에 쓰는 경량 run 요약 구조."""
+
+    id: str
+    command_text: Optional[str] = None
+    phase: str
+    planner_type: Optional[str] = None
+    fallback_used: bool = False
+    created_at: str
+    updated_at: str
+
+
+class ConversationEventRecord(BaseModel):
+    """현재 세션 타임라인의 단일 대화/워크플로우 이벤트."""
+
+    id: int
+    conversation_id: str
+    sequence_no: int
+    event_type: str
+    payload: Dict[str, Any]
+    created_at: str
 
 
 class RegistryToggleRequest(BaseModel):
@@ -241,24 +328,6 @@ class PromptActivateVersionRequest(BaseModel):
 
 
 DEFAULT_MCP_CATALOG = [
-    MpcDefinition(
-        id="planner",
-        name="Planner MCP",
-        scope="계획",
-        description="지령을 구조화하고 실행 전 검토 가능한 플랜으로 변환합니다.",
-        capabilities=["목표 분해", "우선순위 정리", "플랜 초안 생성"],
-        expected_input="사용자 지령, 제약 조건, 확인 포인트",
-        expected_output="플랜 단계, 리스크 포인트, 태스크 초안",
-    ),
-    MpcDefinition(
-        id="memory",
-        name="Memory MCP",
-        scope="기억",
-        description="세션 중 승인 상태와 의사결정 맥락을 유지합니다.",
-        capabilities=["결정사항 보존", "수정 이력 추적", "세션 맥락 주입"],
-        expected_input="이전 플랜, 수정 요청, 승인 이력",
-        expected_output="지속 컨텍스트, 후속 판단 힌트",
-    ),
     MpcDefinition(
         id="filesystem",
         name="Filesystem MCP",
@@ -432,6 +501,11 @@ def serialize_mcps_for_prompt(mcps: List[MpcDefinition]) -> str:
     )
 
 
+def build_planner_capability_map(mcps: List[MpcDefinition]) -> List[Dict[str, Any]]:
+    """planner/ST/classifier에 전달할 capability map을 만든다."""
+    return build_capability_map([mcp.model_dump() for mcp in mcps])
+
+
 def enrich_mcp_definition(mcp: MpcDefinition) -> MpcDefinition:
     """특정 MCP에 런타임 특화 capability 설명을 보강한다."""
     capabilities = list(mcp.capabilities)
@@ -452,42 +526,53 @@ def list_prompt_records() -> List[PromptRecord]:
     return [PromptRecord(**item) for item in list_prompt_entries()]
 
 
-def validate_mcp_ids(ids: List[str], mcps: List[MpcDefinition]) -> List[str]:
-    """주어진 id 목록 중 실제 MCP 카탈로그에 존재하는 값만 남긴다."""
-    known_ids = {mcp.id for mcp in mcps}
-    return [mcp_id for mcp_id in ids if mcp_id in known_ids]
-
-
-def to_runtime_plan(plan: PlanDraft) -> RuntimePlan:
-    """UI용 PlanDraft를 런타임용 RuntimePlan으로 변환한다."""
-    return RuntimePlan(
-        objective=plan.objective,
-        summary=plan.summary,
-        proposed_tasks=[
-            RuntimeTask(
-                title=item.title,
-                rationale=item.rationale,
-                recommended_mcp_ids=item.recommended_mcp_ids,
-                selected_mcp_id=item.selected_mcp_id,
-                tool_name=item.tool_name,
-                tool_arguments=item.tool_arguments,
-                expected_result=item.expected_result,
-            )
-            for item in plan.proposed_tasks
-        ],
-    )
-
-
-def from_runtime_plan(plan: RuntimePlan) -> PlanDraft:
-    """런타임 결과를 UI용 PlanDraft로 변환한다."""
+def normalized_plan_to_draft(plan: NormalizedPlan) -> PlanDraft:
+    """Normalized plan을 프론트엔드용 PlanDraft로 변환한다."""
     return PlanDraft(
-        objective=plan.objective,
+        objective=plan.goal,
         summary=plan.summary,
+        assumptions=plan.assumptions,
+        constraints=plan.constraints,
+        required_capabilities=plan.required_capabilities,
+        approval_required=plan.approval_required,
+        risks=plan.risks,
+        expected_outputs=plan.expected_outputs,
+        planner_metadata=plan.planner_metadata.model_dump(),
+        strategy=StrategyDraft(**plan.strategy.model_dump()) if plan.strategy else None,
         proposed_tasks=[
             ProposedTask(
                 title=item.title,
                 rationale=item.rationale,
                 recommended_mcp_ids=item.recommended_mcp_ids or ([item.selected_mcp_id] if item.selected_mcp_id else []),
+                selected_mcp_id=item.selected_mcp_id,
+                tool_name=item.tool_name,
+                tool_arguments=item.tool_arguments,
+                expected_result=item.expected_result,
+            )
+            for item in plan.tasks_draft
+        ],
+    )
+
+
+def draft_to_normalized_plan(plan: PlanDraft) -> NormalizedPlan:
+    """프론트엔드에서 되돌아온 PlanDraft를 normalized plan으로 복원한다."""
+    return NormalizedPlan(
+        goal=plan.objective,
+        intent="command",
+        summary=plan.summary,
+        assumptions=list(plan.assumptions),
+        constraints=list(plan.constraints),
+        required_capabilities=list(plan.required_capabilities),
+        approval_required=plan.approval_required,
+        risks=list(plan.risks),
+        expected_outputs=list(plan.expected_outputs),
+        planner_metadata=PlannerMetadata(**plan.planner_metadata) if plan.planner_metadata else PlannerMetadata(),
+        strategy=plan.strategy.model_dump() if plan.strategy else None,
+        tasks_draft=[
+            NormalizedTaskDraft(
+                title=item.title,
+                rationale=item.rationale,
+                recommended_mcp_ids=item.recommended_mcp_ids,
                 selected_mcp_id=item.selected_mcp_id,
                 tool_name=item.tool_name,
                 tool_arguments=item.tool_arguments,
@@ -539,6 +624,76 @@ def fallback_plan(command: str, detailed: bool) -> List[ProposedTask]:
         )
         for index, item in enumerate(base_plan)
     ]
+
+
+def get_conversation_id(request: Request) -> str:
+    """현재 브라우저 세션에 연결된 conversation_id를 반환하고 없으면 생성한다."""
+    conversation_id = request.session.get("conversation_id")
+    if not conversation_id:
+        conversation_id = str(uuid.uuid4())
+        request.session["conversation_id"] = conversation_id
+    return str(conversation_id)
+
+
+def append_message_event(request: Request, event_type: str, text: str) -> None:
+    """단일 메시지를 DB 기반 타임라인에 저장한다."""
+    append_conversation_event(get_conversation_id(request), event_type, {"text": text})
+
+
+def append_workflow_snapshot_event(
+    request: Request,
+    *,
+    phase: str,
+    approval: str,
+    plan: Optional[PlanDraft],
+    tasks: List[TaskItem],
+    execution_log: List[str],
+    execution_report: Optional[Dict[str, Any]],
+    trace: List[Dict[str, Any]],
+    run_id: Optional[str],
+) -> None:
+    """현재 워크플로우 상태를 하나의 snapshot 이벤트로 저장한다."""
+    append_conversation_event(
+        get_conversation_id(request),
+        "workflow_snapshot",
+        {
+            "phase": phase,
+            "approval": approval,
+            "plan": plan.model_dump() if plan else None,
+            "tasks": [task.model_dump() for task in tasks],
+            "executionLog": execution_log,
+            "executionReport": execution_report,
+            "traceEvents": trace,
+            "currentRunId": run_id,
+        },
+    )
+
+
+def build_assistant_report_reply(report: Dict[str, Any]) -> str:
+    """실행 보고서를 채팅형 최종 응답으로 압축한다."""
+    result_items = [str(item).strip() for item in report.get("result_items", []) if str(item).strip()]
+    findings = [str(item).strip() for item in report.get("findings", []) if str(item).strip()]
+    summary = str(report.get("summary", "")).strip()
+    conclusion = str(report.get("conclusion", "")).strip()
+
+    lines: List[str] = []
+    if result_items:
+        lines.append("결과를 보고합니다.")
+        lines.extend(result_items[:8])
+    elif findings:
+        lines.append("결과를 보고합니다.")
+        lines.extend(findings[:4])
+    elif summary:
+        lines.append(summary)
+    elif conclusion:
+        lines.append(conclusion)
+    else:
+        lines.append("실행은 완료되었지만 요약 가능한 결과를 아직 만들지 못했습니다.")
+
+    if conclusion and conclusion not in lines[-1]:
+        lines.extend(["", conclusion])
+
+    return "\n".join(lines)
 
 
 @app.get("/api/health")
@@ -650,6 +805,38 @@ def update_prompt(prompt_id: str, payload: PromptUpdateRequest) -> PromptRecord:
         return PromptRecord(**append_prompt_version(prompt_id, payload.model_dump()))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/runs/{run_id}", response_model=WorkflowRunRecord)
+def get_saved_workflow_run(run_id: str) -> WorkflowRunRecord:
+    """저장된 workflow trace/report 스냅샷을 반환한다."""
+    item = get_workflow_run(run_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Workflow run not found.")
+    return WorkflowRunRecord(**item)
+
+
+@app.get("/api/runs", response_model=List[WorkflowRunSummary])
+def list_saved_workflow_runs(limit: int = 20) -> List[WorkflowRunSummary]:
+    """최근 workflow run 목록을 반환한다."""
+    safe_limit = max(1, min(limit, 100))
+    return [WorkflowRunSummary(**item) for item in list_workflow_runs(safe_limit)]
+
+
+@app.get("/api/conversation/events", response_model=List[ConversationEventRecord])
+def get_conversation_events(request: Request) -> List[ConversationEventRecord]:
+    """현재 세션의 대화 타임라인 이벤트를 시간순으로 반환한다."""
+    return [
+        ConversationEventRecord(**item)
+        for item in list_conversation_events(get_conversation_id(request))
+    ]
+
+
+@app.post("/api/conversation/reset")
+def reset_conversation(request: Request) -> Dict[str, str]:
+    """세션의 conversation_id를 새로 발급해 새 타임라인을 시작한다."""
+    request.session["conversation_id"] = str(uuid.uuid4())
+    return {"conversation_id": request.session["conversation_id"]}
 
 
 @app.post("/api/prompts/{prompt_id}/activate-version", response_model=PromptRecord)
@@ -833,7 +1020,9 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
 
     model = os.getenv("CODEX_CHAT_MODEL", "default")
     message = payload.message.strip()
+    append_message_event(request, "user_message", message)
     mcps = load_mcp_catalog()
+    capability_map = build_planner_capability_map(mcps)
 
     try:
         intent = await classify_chat_intent(model=model, message=message, mcps=mcps, conversation=payload.conversation)
@@ -841,14 +1030,26 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
         intent = fallback_chat_intent(message, payload.conversation)
 
     if intent == "command":
-        runtime_plan = await get_runtime().build_plan(
+        planner_context = {"trace": []}
+        run_id = str(uuid.uuid4())
+        runtime_plan = await get_planner().build_plan(
             command=message,
             soul=read_soul_prompt(),
-            mcp_catalog=[mcp.model_dump() for mcp in mcps],
+            mcp_catalog=capability_map,
             detailed=False,
-            context=None,
+            context=planner_context,
         )
-        plan = from_runtime_plan(runtime_plan)
+        normalized_plan = normalize_runtime_plan(runtime_plan, planner_context.get("trace", []))
+        plan = normalized_plan_to_draft(normalized_plan)
+        upsert_workflow_run(
+            run_id,
+            phase="review",
+            command_text=message,
+            planner_type=normalized_plan.planner_metadata.planner_type,
+            fallback_used=normalized_plan.planner_metadata.fallback_used,
+            plan=plan.model_dump(),
+        )
+        replace_workflow_trace(run_id, planner_context.get("trace", []))
         workflow = WorkflowResponse(
             phase="review",
             approval="pending",
@@ -856,6 +1057,20 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
             plan=plan,
             tasks=[],
             mcps=mcps,
+            trace=planner_context.get("trace", []),
+            run_id=run_id,
+        )
+        append_message_event(request, "assistant_message", "지령을 분석해 MCP-aware 플랜 초안을 생성했습니다. 아래 단계를 검토해 주십시오.")
+        append_workflow_snapshot_event(
+            request,
+            phase="review",
+            approval="pending",
+            plan=plan,
+            tasks=[],
+            execution_log=[],
+            execution_report=None,
+            trace=planner_context.get("trace", []),
+            run_id=run_id,
         )
         return ChatResponse(
             reply="지령을 분석해 MCP-aware 플랜 초안을 생성했습니다. 아래 단계를 검토해 주십시오.",
@@ -875,6 +1090,7 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    append_message_event(request, "assistant_message", reply)
     return ChatResponse(reply=reply, response_id=response_id, model=model, mode="answer")
 
 
@@ -883,15 +1099,40 @@ async def create_plan(request: Request, payload: CommandRequest) -> WorkflowResp
     """지령을 받아 승인 전 플랜을 생성한다."""
     command = payload.command.strip()
     mcps = load_mcp_catalog()
-    credential = get_optional_openai_credential(request)
-    runtime_plan = await get_runtime().build_plan(
+    capability_map = build_planner_capability_map(mcps)
+    planner_context = {"trace": []}
+    run_id = str(uuid.uuid4())
+    append_message_event(request, "user_message", command)
+    runtime_plan = await get_planner().build_plan(
         command=command,
         soul=read_soul_prompt(),
-        mcp_catalog=[mcp.model_dump() for mcp in mcps],
+        mcp_catalog=capability_map,
         detailed=False,
-        context=None,
+        context=planner_context,
     )
-    plan = from_runtime_plan(runtime_plan)
+    normalized_plan = normalize_runtime_plan(runtime_plan, planner_context.get("trace", []))
+    plan = normalized_plan_to_draft(normalized_plan)
+    upsert_workflow_run(
+        run_id,
+        phase="review",
+        command_text=command,
+        planner_type=normalized_plan.planner_metadata.planner_type,
+        fallback_used=normalized_plan.planner_metadata.fallback_used,
+        plan=plan.model_dump(),
+    )
+    replace_workflow_trace(run_id, planner_context.get("trace", []))
+    append_message_event(request, "assistant_message", "지령을 분석해 플랜 초안을 생성했습니다. 검토 후 승인하거나 수정하십시오.")
+    append_workflow_snapshot_event(
+        request,
+        phase="review",
+        approval="pending",
+        plan=plan,
+        tasks=[],
+        execution_log=[],
+        execution_report=None,
+        trace=planner_context.get("trace", []),
+        run_id=run_id,
+    )
     return WorkflowResponse(
         phase="review",
         approval="pending",
@@ -899,6 +1140,8 @@ async def create_plan(request: Request, payload: CommandRequest) -> WorkflowResp
         plan=plan,
         tasks=[],
         mcps=mcps,
+        trace=planner_context.get("trace", []),
+        run_id=run_id,
     )
 
 
@@ -907,15 +1150,39 @@ async def revise_plan(request: Request, payload: ReviewRequest) -> WorkflowRespo
     """플랜 세분화 요청을 받아 더 자세한 플랜을 생성한다."""
     command = payload.command.strip()
     mcps = load_mcp_catalog()
-    credential = get_optional_openai_credential(request)
-    runtime_plan = await get_runtime().build_plan(
+    capability_map = build_planner_capability_map(mcps)
+    planner_context = {"trace": []}
+    run_id = str(uuid.uuid4())
+    runtime_plan = await get_planner().build_plan(
         command=command,
         soul=read_soul_prompt(),
-        mcp_catalog=[mcp.model_dump() for mcp in mcps],
+        mcp_catalog=capability_map,
         detailed=True,
-        context=None,
+        context=planner_context,
     )
-    plan = from_runtime_plan(runtime_plan)
+    normalized_plan = normalize_runtime_plan(runtime_plan, planner_context.get("trace", []))
+    plan = normalized_plan_to_draft(normalized_plan)
+    upsert_workflow_run(
+        run_id,
+        phase="review",
+        command_text=command,
+        planner_type=normalized_plan.planner_metadata.planner_type,
+        fallback_used=normalized_plan.planner_metadata.fallback_used,
+        plan=plan.model_dump(),
+    )
+    replace_workflow_trace(run_id, planner_context.get("trace", []))
+    append_message_event(request, "system_message", f"플랜 수정 요청 {payload.revision_count}회를 반영했습니다.")
+    append_workflow_snapshot_event(
+        request,
+        phase="review",
+        approval="pending",
+        plan=plan,
+        tasks=[],
+        execution_log=[],
+        execution_report=None,
+        trace=planner_context.get("trace", []),
+        run_id=run_id,
+    )
     return WorkflowResponse(
         phase="review",
         approval="pending",
@@ -923,14 +1190,62 @@ async def revise_plan(request: Request, payload: ReviewRequest) -> WorkflowRespo
         plan=plan,
         tasks=[],
         mcps=mcps,
+        trace=planner_context.get("trace", []),
+        run_id=run_id,
     )
 
 
 @app.post("/api/approve", response_model=WorkflowResponse)
-def approve_plan(payload: ApproveRequest) -> WorkflowResponse:
+def approve_plan(request: Request, payload: ApproveRequest) -> WorkflowResponse:
     """승인된 플랜을 실행 태스크 목록으로 확정한다."""
     mcps = load_mcp_catalog()
-    tasks = build_tasks(payload.plan, mcps)
+    normalized_plan = draft_to_normalized_plan(payload.plan)
+    compiled_tasks = compile_tasks(normalized_plan, [mcp.model_dump() for mcp in mcps])
+    trace = [
+        {"event": "task_compiler.started", "task_draft_count": len(normalized_plan.tasks_draft)},
+        {
+            "event": "task_compiler.completed",
+            "task_count": len(compiled_tasks),
+            "planner_type": normalized_plan.planner_metadata.planner_type,
+            "fallback_used": normalized_plan.planner_metadata.fallback_used,
+        },
+    ]
+    tasks = [
+        TaskItem(
+            id=task.id,
+            title=task.title,
+            status="queued",
+            mcp_ids=task.mcp_ids,
+            selected_mcp_id=task.selected_mcp_id,
+            tool_name=task.tool_name,
+            tool_arguments=task.tool_arguments,
+            expected_result=task.expected_result,
+        )
+        for task in compiled_tasks
+    ]
+    run_id = payload.run_id or str(uuid.uuid4())
+    upsert_workflow_run(
+        run_id,
+        phase="tasking",
+        command_text=payload.plan.objective,
+        planner_type=normalized_plan.planner_metadata.planner_type,
+        fallback_used=normalized_plan.planner_metadata.fallback_used,
+        plan=payload.plan.model_dump(),
+        tasks=[task.model_dump() for task in tasks],
+    )
+    replace_workflow_trace(run_id, trace)
+    append_message_event(request, "system_message", "플랜 승인이 기록되었습니다.")
+    append_workflow_snapshot_event(
+        request,
+        phase="tasking",
+        approval="approved",
+        plan=payload.plan,
+        tasks=tasks,
+        execution_log=[],
+        execution_report=None,
+        trace=trace,
+        run_id=run_id,
+    )
     return WorkflowResponse(
         phase="tasking",
         approval="approved",
@@ -938,16 +1253,18 @@ def approve_plan(payload: ApproveRequest) -> WorkflowResponse:
         plan=payload.plan,
         tasks=tasks,
         mcps=mcps,
+        trace=trace,
+        run_id=run_id,
     )
 
 
 @app.post("/api/execute", response_model=ExecuteResponse)
 async def execute_workflow(request: Request, payload: ExecuteRequest) -> ExecuteResponse:
     """확정된 태스크를 실행하고 로그/보고를 반환한다."""
-    credential = get_optional_openai_credential(request)
-    runtime_result = await get_runtime().execute_tasks(
+    execution_context = {"mcp_catalog": [mcp.model_dump() for mcp in load_mcp_catalog()], "trace": []}
+    runtime_result = await get_executor().execute_tasks(
         to_runtime_tasks(payload.tasks),
-        context={"mcp_catalog": [mcp.model_dump() for mcp in load_mcp_catalog()]},
+        context=execution_context,
     )
     updated_tasks: List[TaskItem] = []
     for index, task in enumerate(payload.tasks):
@@ -964,12 +1281,37 @@ async def execute_workflow(request: Request, payload: ExecuteRequest) -> Execute
                 expected_result=task.expected_result,
             )
         )
+    run_id = payload.run_id or str(uuid.uuid4())
+    upsert_workflow_run(
+        run_id,
+        phase="completed",
+        planner_type=None,
+        fallback_used=False,
+        tasks=[task.model_dump() for task in updated_tasks],
+        report=runtime_result.report,
+    )
+    replace_workflow_trace(run_id, execution_context.get("trace", []))
+    append_message_event(request, "system_message", "실행 완료. 결과를 보고합니다.")
+    append_workflow_snapshot_event(
+        request,
+        phase="completed",
+        approval="approved",
+        plan=None,
+        tasks=updated_tasks,
+        execution_log=runtime_result.execution_log,
+        execution_report=runtime_result.report,
+        trace=execution_context.get("trace", []),
+        run_id=run_id,
+    )
+    append_message_event(request, "assistant_message", build_assistant_report_reply(runtime_result.report))
     return ExecuteResponse(
         phase="completed",
         message="승인된 실행 태스크를 순서대로 수행하고 결과 보고까지 마쳤습니다.",
         tasks=updated_tasks,
         execution_log=runtime_result.execution_log,
         execution_report=runtime_result.report,
+        trace=execution_context.get("trace", []),
+        run_id=run_id,
     )
 
 
@@ -1067,50 +1409,6 @@ def normalize_plan_steps(plan: List[ProposedTask]) -> List[ProposedTask]:
 
     return normalized or plan[:1]
 
-
-def build_tasks(plan: PlanDraft, mcps: List[MpcDefinition]) -> List[TaskItem]:
-    """승인된 플랜을 UI/실행용 TaskItem 목록으로 확정한다."""
-    tasks: List[TaskItem] = []
-    for index, item in enumerate(plan.proposed_tasks, start=1):
-        mcp_ids = validate_mcp_ids(item.recommended_mcp_ids, mcps) or map_task_to_mcps(item.title, index - 1)
-        selected_mcp_id = item.selected_mcp_id if item.selected_mcp_id in {mcp.id for mcp in mcps} else None
-        if not selected_mcp_id and mcp_ids:
-            selected_mcp_id = mcp_ids[0]
-        tasks.append(
-            TaskItem(
-                id=index,
-                title=item.title.rstrip("."),
-                status="queued",
-                mcp_ids=mcp_ids,
-                selected_mcp_id=selected_mcp_id,
-                tool_name=item.tool_name,
-                tool_arguments=item.tool_arguments,
-                expected_result=item.expected_result,
-            )
-        )
-    return tasks
-
-
-def map_task_to_mcps(task_title: str, index: int) -> List[str]:
-    """구조화 정보가 없을 때 제목 기반으로 기본 MCP 후보를 추정한다."""
-    normalized = task_title.lower()
-    ids: List[str] = []
-
-    def add(mcp_id: str) -> None:
-        if mcp_id not in ids:
-            ids.append(mcp_id)
-
-    if index == 0 or "정의" in normalized or "분해" in normalized:
-        add("planner")
-        add("memory")
-
-    if "준비물" in normalized or "의존성" in normalized or "확인" in normalized:
-        add("docs")
-        add("filesystem")
-
-    if "실행" in normalized or "작업 단위" in normalized or "태스크" in normalized:
-        add("terminal")
-        add("filesystem")
 
     if "완료 기준" in normalized or "검증" in normalized:
         add("browser")
@@ -1401,7 +1699,7 @@ async def classify_chat_intent(
         template,
         {
             "conversation": format_conversation_history(conversation),
-            "mcps": serialize_mcps_for_prompt(mcps),
+            "mcps": json.dumps(build_planner_capability_map(mcps), ensure_ascii=False, indent=2),
             "message": message,
         },
     )
@@ -1476,10 +1774,14 @@ def read_soul_prompt() -> str:
     return content
 
 
-def get_runtime():
-    """현재 설정된 런타임 구현체를 soul prompt와 함께 생성한다."""
-    # 런타임 선택은 환경변수로 통제하고, system prompt(soul)를 함께 주입한다.
-    return get_agent_runtime(read_soul_prompt())
+def get_planner():
+    """현재 설정 기준 planner runtime 구현체를 반환한다."""
+    return get_planner_runtime(read_soul_prompt())
+
+
+def get_executor():
+    """현재 설정 기준 stable executor 구현체를 반환한다."""
+    return get_executor_runtime()
 
 
 def get_optional_openai_credential(request: Request) -> Optional[Dict[str, Any]]:

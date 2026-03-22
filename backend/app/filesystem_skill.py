@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-"""Filesystem MCP 결과를 사용자 의도에 맞는 보고 형태로 해석하는 skill layer."""
+"""Filesystem MCP 결과를 사용자 지향 결과물로 해석하는 skill layer.
+
+Filesystem MCP의 raw 응답을 findings, evidence, result_items로 정리하되,
+planner가 해야 할 의미 판단을 과도하게 흡수하지 않도록 최소 해석만 수행한다.
+"""
 
 import json
 from email.utils import parsedate_to_datetime

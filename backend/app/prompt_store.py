@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-"""Prompt DB 조회와 템플릿 치환만 담당하는 얇은 store helper."""
+"""Prompt DB 조회와 템플릿 치환만 담당하는 얇은 helper.
+
+실제 저장은 sqlite_store가 담당하고, 이 모듈은 planner/bridge/main이
+프롬프트 본문을 단순하게 읽고 렌더링하도록 돕는다.
+"""
 
 from typing import Any, Dict
 

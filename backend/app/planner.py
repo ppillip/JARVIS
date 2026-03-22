@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-"""독립 planner 서비스. 현재는 bridge를 통해 MCP-aware 계획 JSON을 생성한다."""
+"""독립 planner 서비스.
+
+메인 백엔드와 분리된 planning 엔드포인트를 제공하며, bridge를 통해
+MCP-aware 계획 JSON을 생성하는 실험/호환 경로로 사용된다.
+"""
 
 import json
 import os
@@ -120,8 +124,7 @@ def fallback_plan(command: str, detailed: bool, mcps: List[MpcDefinition]) -> Li
             "각 작업의 완료 기준과 검증 포인트를 명시한다.",
         ]
 
-    mcps_by_scope = {mcp.scope: mcp.id for mcp in mcps}
-    default_ids = [mcps_by_scope.get("계획", "planner")]
+    default_ids: List[str] = []
     return [
         PlanStep(
             step=item,
@@ -157,7 +160,11 @@ async def planner_plan(payload: PlannerRequest) -> PlannerResponse:
             "- selected_mcp_id는 recommended_mcp_ids 중 하나여야 한다.\n"
             "- 실제로 바로 수행 가능한 단순 조회/읽기 지령이면 1~2단계로 줄이고 메타 검토 단계를 만들지 않는다.\n"
             "- 사용자가 명시하지 않은 추가 범위나 추가 경로를 임의로 탐색하지 않는다.\n"
-            "- 사용자가 단일 목록 조회나 단일 보고를 요청했으면 정확히 1개의 실행 단계만 만든다.\n"
+            "- '최종 보고가 하나'라는 이유만으로 실행 단계를 1개로 제한하지 않는다.\n"
+            "- 사용자가 여러 결과값을 요구하면 데이터 취득/필터링/정렬/비교/집계를 분리해 여러 단계로 만들 수 있다.\n"
+            "- 동일 MCP 하나만 쓰더라도 중간 계산이 필요하면 여러 실행 단계를 만든다.\n"
+            "- 조회 단계와 계산/판단 단계를 한 단계에 뭉개지 않는다.\n"
+            "- expected_result에는 각 단계가 직접 산출하는 중간 결과 또는 최종 결과를 적는다.\n"
             "- 최종 보고는 시스템이 수행하므로 '보고용 정리 단계'를 별도 step으로 만들지 않는다.\n"
             "- MCP capability에 tool 정보가 있으면 tool_name과 tool_arguments를 반드시 채운다.\n"
             "- Filesystem MCP의 허용 경로가 $HOME, $PROJECT_ROOT 로 제한되어 있으면 그 범위를 벗어나는 path를 계획하지 않는다.\n"

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-"""Filesystem 실행 전에 적용되는 경로 정규화와 기본 안전장치."""
+"""Filesystem 실행 전에 적용되는 경로 정규화와 기본 안전장치.
+
+planner가 만든 tool arguments를 그대로 실행하지 않고, 허용 경로와 변수 치환,
+기본 의도 플래그 같은 실행 전 검증을 여기서 처리한다.
+"""
 
 from pathlib import Path
 from typing import Any, Dict
@@ -47,3 +51,15 @@ def wants_file_count(task_title: str, expected_result: str) -> bool:
     """태스크 제목/예상 결과가 파일 개수 조회 의도인지 간단히 판정한다."""
     normalized = f"{task_title} {expected_result}".lower()
     return "파일" in normalized and ("몇" in normalized or "개수" in normalized or "count" in normalized)
+
+
+def wants_oldest_file(task_title: str, expected_result: str) -> bool:
+    """태스크 제목/예상 결과가 가장 오래된 파일 확인 의도인지 판정한다."""
+    normalized = f"{task_title} {expected_result}".lower()
+    return "파일" in normalized and ("오래된" in normalized or "가장 오래" in normalized or "oldest" in normalized)
+
+
+def wants_latest_file(task_title: str, expected_result: str) -> bool:
+    """태스크 제목/예상 결과가 가장 최근 파일 확인 의도인지 판정한다."""
+    normalized = f"{task_title} {expected_result}".lower()
+    return "파일" in normalized and ("최근" in normalized or "최신" in normalized or "latest" in normalized)

@@ -2,12 +2,20 @@
 
 Python 백엔드와 Svelte 프론트엔드로 구성한 승인 기반 자비스형 챗봇입니다.
 
+## 개발 기록
+
+- [2026.03.22.devHistory.md](./2026.03.22.devHistory.md)
+
+## 잔여 작업들
+
+- [TODO.md](./TODO.md)
+
 ## 포트 정책
 
 JARVIS는 앞으로 무조건 `7000`번대 포트만 사용합니다.
 
 - MCP Registry: `7100`
-- Planner MCP: `7200`
+- Planner Service: `7200`
 - Main Backend: `7300`
 - Frontend: `7400`
 - LLM Bridge: `7600`
@@ -18,42 +26,90 @@ JARVIS는 앞으로 무조건 `7000`번대 포트만 사용합니다.
 
 ## 구조
 
-- `backend/`
-  FastAPI API 서버
+### Planner 축
+
 - `backend/app/agent_runtime.py`
-  에이전트 런타임 공통 인터페이스
-- `backend/app/deepagents_runtime.py`
-  Deep Agents 연동 대상 경계
-- `backend/app/llm_bridge.py`
-  OpenAI API 호환 브리지 클라이언트
-- `backend/app/llm_bridge_server.py`
-  OAuth/API key를 수용하는 LLM Bridge 서버
-- `backend/app/mcp_layer.py`
-  MCP adapter / skill / guardrail 인터페이스
+  planner/executor 공통 인터페이스와 공통 데이터 구조
+- `backend/app/deepagent_planner_runtime.py`
+  최종 MCP-aware planner
+- `backend/app/fallback_planner_runtime.py`
+  planner fallback
+- `backend/app/sequential_thinking_assist.py`
+  선택적 전략 보조
+- `backend/app/plan_schema.py`
+  공통 normalized plan schema
+- `backend/app/plan_normalizer.py`
+  planner 출력 정규화
+
+### Executor 축
+
+- `backend/app/task_compiler.py`
+  normalized plan -> executable tasks
+- `backend/app/stable_executor_runtime.py`
+  안정적인 실행 계층
+- `backend/app/filesystem_skill.py`
+  Filesystem MCP 결과 해석
+- `backend/app/report_builder.py`
+  findings / evidence / result_items 기반 최종 보고 생성
+
+### 공통 인프라 축
+
+- `backend/app/capability_map_service.py`
+  MCP registry -> capability layer 변환
+- `backend/app/trace_logger.py`
+  structured trace 생성
+- `backend/app/fallback_reasons.py`
+  fallback reason taxonomy
 - `backend/app/guardrails.py`
-  실행 안전장치 전용 모듈
+  실행 안전장치
+- `backend/app/sqlite_store.py`
+  SQLite 저장 계층
+- `backend/app/prompt_store.py`
+  Prompt DB 접근 계층
+
+### 서비스 계층
+
+- `backend/app/main.py`
+  메인 API
 - `backend/app/registry.py`
-  MCP registry 전용 서버
+  MCP registry 서버
 - `backend/app/planner.py`
-  Planner MCP 전용 서버
+  planner service
+- `backend/app/llm_bridge.py`
+  브리지 클라이언트
+- `backend/app/llm_bridge_server.py`
+  OAuth / API key / local provider를 수용하는 OpenAI 호환 브리지 서버
+- `backend/app/mcp_layer.py`
+  MCP adapter/skill 경계
+- `backend/app/deepagents_runtime.py`
+  Deep Agents 연동 경계
+- `backend/app/classic_runtime.py`
+  레거시 호환 경계
+
+### 프론트와 데이터
+
+- `frontend/src/App.svelte`
+  사용자용 JARVIS UI
+- `frontend/src/RegistryAdmin.svelte`
+  관리자 화면
 - `data/jarvis.db`
-  MCP 레지스트리와 프롬프트를 저장하는 SQLite DB
-- `frontend/`
-  Svelte + Vite UI
+  MCP registry, prompts, workflow runs, trace, conversation timeline 저장소
 - `soul.md`
-  자비스의 말투와 태도 규칙
+  자비스 말투와 태도 규칙
 
 ## 현재 기능
 
-- 지령 입력
-- 플랜 초안 생성
-- 플랜 수정 요청
-- 플랜 승인 후 태스크 생성
-- OpenAI OAuth 로그인 상태 표시
-- 태스크별 MCP 매핑 표시
-- MCP 클릭 시 상세 정보 표시
-- 프롬프트 DB 기반 LLM 프롬프트 관리
+- OpenAI GUI OAuth 로그인
+- 지령 입력 시 planner 기반 플랜 초안 생성
+- 플랜 수정 요청 / 승인
+- 승인 후 task compiler를 통한 실행 태스크 확정
+- Stable Executor를 통한 MCP 실행
 - Filesystem MCP 실제 호출
+- structured trace 생성 및 저장
+- SQLite 기반 대화 타임라인 저장 및 렌더링
+- Prompt DB 기반 프롬프트 관리
+- MCP Registry 관리 화면
+- Runs / Trace 조회
 - 브리지 기반 LLM 호출
 
 ## 로그인 설정
@@ -112,7 +168,7 @@ uvicorn app.registry:app --reload --port 7100
 
 기본 주소: `http://127.0.0.1:7100`
 
-### 2. Planner MCP 서버
+### 2. Planner 서비스
 
 ```bash
 cd backend
@@ -171,9 +227,18 @@ uvicorn app.main:app --reload --port 7300
 
 메인 백엔드는 기본적으로:
 - `MCP_REGISTRY_URL`로 registry server를 호출해 MCP 목록을 받습니다.
-- `LLM_BRIDGE_URL`을 통해 LLM을 호출합니다.
+- `LLM_BRIDGE_URL`을 통해 planner/chat LLM을 호출합니다.
+- `JARVIS_AGENT_RUNTIME`에 따라 planner 축을 선택합니다.
 
-Bridge 또는 live runtime이 불가능하면 runtime fallback 경로를 시도합니다.
+지원 runtime 모드:
+- `classic`
+- `deepagents`
+- `sequential`
+
+현재 권장:
+```bash
+export JARVIS_AGENT_RUNTIME=sequential
+```
 
 ### 5. 프론트엔드
 
@@ -192,48 +257,79 @@ Vite dev server는 `/api` 요청을 백엔드로 프록시합니다.
 - 사용자 화면: `http://127.0.0.1:7400/`
 - 관리자 화면: `http://127.0.0.1:7400/#/registry-admin`
 
-관리자 화면에서는 두 가지를 관리할 수 있습니다.
+관리자 화면에서는 다음을 관리할 수 있습니다.
 
 - MCP Registry 활성/비활성 및 신규 MCP 추가
 - Prompt DB 조회, 생성, 수정, 삭제
 - Prompt 버전 이력 확인, 활성 버전 선택, 이전 버전 복구
+- 최근 run 및 trace 조회
 
 현재 시스템은 코드에 박힌 문자열 대신 SQLite `data/jarvis.db`를 읽어 다음 프롬프트를 LLM에 전달합니다.
 
 - `intent_classifier`
 - `chat_system`
 - `planner_system`
+- `deepagent_planner_system`
 
 프롬프트를 수정하면 새 버전이 쌓이고, 관리자 화면에서 원하는 버전을 다시 활성화해 복구할 수 있습니다.
 
 MCP 레지스트리도 같은 SQLite DB에 저장됩니다.
 
+## 저장 구조
+
+주요 저장 대상:
+
+- `mcp_registry`
+  활성 MCP registry
+- `prompt_definitions`, `prompt_versions`
+  Prompt DB
+- `workflow_runs`
+  플랜/실행/보고 스냅샷
+- `workflow_trace_events`
+  structured trace
+- `conversation_events`
+  채팅/플랜/승인/실행/보고 타임라인
+
+즉 프론트 대화창은 더 이상 임시 메모리만으로 그리지 않고, DB에 저장된 타임라인을 기준으로 시간순 렌더링합니다.
+
+## 현재 아키텍처 원칙
+
+JARVIS는 다음 원칙을 기준으로 정리되어 있습니다.
+
+- 생각은 PlannerRuntime
+- 실행은 ExecutorRuntime
+- 번역은 TaskCompiler
+- 가능성 판단은 CapabilityMap
+- 운영 가시성은 Structured Trace
+
+즉:
+- `Sequential Thinking`: 선택적 전략 보조
+- `Deep Agent`: 최종 planner / replanner
+- `Executor`: 안정적인 집행 / evidence / report
+
 ## 다음 확장 후보
 
-- 실제 LLM API 연동
-- 세션 저장과 복원
-- 태스크별 실제 MCP 호출 로그
-- 자유 입력형 플랜 수정 요청
+- planner 품질 고도화
+- capability taxonomy 정교화
+- MCP별 skill/adapter 확장
+- local OpenAI-compatible provider 검증
+- 보고 품질 개선
 
 ## Deep Agents 방향
 
-JARVIS는 장기적으로 `Deep Agents + MCP Layer + Guardrails + UI` 구조로 이행하는 것이 목표입니다.
+JARVIS는 현재 `Deep Agent planner + Stable Executor + Bridge + Registry` 구조를 향해 정리되어 있습니다.
 
-- 공식 벤치마킹 및 권장 아키텍처: [DeepAgents벤치마킹.md](/Users/ppillip/Projects/NiceCodex/DeepAgents벤치마킹.md)
-- 현재는 준비 단계로 다음 골격이 추가되어 있습니다.
-  - `agent_runtime.py`
-  - `deepagents_runtime.py`
-  - `mcp_layer.py`
-  - `guardrails.py`
+- 참고: [DeepAgents벤치마킹.md](/Users/ppillip/Projects/NiceCodex/DeepAgents벤치마킹.md)
 
-즉 앞으로는:
+현재 해석:
+- `SequentialThinkingAssist`
+  - planner가 아니라 전략 보조
+- `DeepAgentPlannerRuntime`
+  - MCP-aware planning / replanning
+- `StableExecutorRuntime`
+  - 실행 / evidence / report
 
-- Deep Agents: planning / orchestration / memory
-- MCP Layer: MCP adapter / skill
-- Guardrails: 안전 검증
-- UI: 승인 / 보고
-
-로 역할을 분리해 갈 수 있습니다.
+즉 Deep Agents는 executor가 아니라 planner 축에 우선 고정하는 방향입니다.
 
 ## soul.md
 
@@ -246,32 +342,39 @@ JARVIS는 장기적으로 `Deep Agents + MCP Layer + Guardrails + UI` 구조로 
 - `자비스는 항상 짧고 단호하게 말한다`
 
 즉 말투나 태도를 바꾸고 싶으면 `soul.md`를 수정하면 됩니다.
+
 ## Agent Runtime
 
-JARVIS core orchestration now runs behind a runtime boundary.
+현재 JARVIS는 planner/executor 분리 구조를 가집니다.
 
-- default: `classic`
-- optional: `deepagents`
-- 공통 LLM 호출 계층: `llm_bridge_server`
+- planner runtime
+  - `deepagents`
+  - `classic`
+  - `sequential`
+- executor runtime
+  - `stable_executor`
 
-Set runtime explicitly:
+실행 흐름:
 
-```bash
-export JARVIS_AGENT_RUNTIME=classic
-```
+1. request classifier
+2. optional sequential thinking assist
+3. deep agent planner 또는 fallback planner
+4. plan normalizer
+5. approval
+6. task compiler
+7. stable executor
+8. trace / report / timeline 저장
 
-or
+runtime 동작 원칙:
 
-```bash
-export JARVIS_AGENT_RUNTIME=deepagents
-```
+- `classic`
+  - fallback planner와 stable executor 중심 경로
+- `deepagents`
+  - Deep Agent planner를 우선 사용하고 planner fallback이 가능
+- `sequential`
+  - 필요 시 Sequential Thinking이 전략 보조 후 Deep Agent planner에 handoff
 
-Current behavior:
-
-- `classic`: bridge를 통해 직접 planning을 수행하고 MCP를 실행
-- `deepagents`: bridge를 통해 모델을 사용하려 시도하고, live 실행이 실패하면 `classic`으로 폴백
-
-원칙:
+공통 원칙:
 
 - 런타임은 로그인/OAuth를 직접 다루지 않습니다.
 - 모든 LLM 호출은 Bridge를 거칩니다.

@@ -651,6 +651,26 @@ p {
   padding-bottom: 16px;
 }
 
+.strategy-panel {
+  margin: 14px 0 18px;
+  padding: 14px 16px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 18px;
+  background: linear-gradient(180deg, rgba(13, 32, 46, 0.9), rgba(8, 22, 34, 0.88));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+.strategy-panel h4 {
+  margin: 0;
+  font-size: 0.96rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.strategy-list li + li {
+  margin-top: 8px;
+}
+
 .card-title-row,
 .mcp-item-header,
 .mcp-task-header {
@@ -683,6 +703,15 @@ p {
 
 .compact-list {
   margin-top: 8px;
+}
+
+.trace-list code {
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: rgba(235, 247, 255, 0.94);
+  font-size: 0.86rem;
+  line-height: 1.65;
 }
 
 .task-meta {
@@ -718,6 +747,30 @@ p {
   padding: 0 24px 16px;
   background: linear-gradient(180deg, rgba(5, 14, 22, 0), rgba(5, 14, 22, 0.94) 32%);
   border-top: 1px solid rgba(92, 219, 255, 0.08);
+}
+
+.live-status-panel {
+  display: grid;
+  gap: 6px;
+  margin: 0 24px 14px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(118, 233, 255, 0.2);
+  background: linear-gradient(180deg, rgba(13, 34, 48, 0.82), rgba(8, 20, 31, 0.88));
+  box-shadow: inset 0 1px 0 rgba(240, 252, 255, 0.05);
+}
+
+.live-status-label {
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: rgba(133, 227, 248, 0.82);
+}
+
+.live-status-panel strong {
+  color: #f8feff;
+  font-size: 0.95rem;
+  line-height: 1.45;
 }
 
 .status-pill {

@@ -1,23 +1,5 @@
 [
   {
-    "id": "planner",
-    "name": "Planner MCP",
-    "scope": "계획",
-    "description": "지령을 구조화하고 실행 전 검토 가능한 플랜으로 변환합니다.",
-    "capabilities": [
-      "목표 분해",
-      "우선순위 정리",
-      "플랜 초안 생성"
-    ],
-    "expected_input": "사용자 지령, 제약 조건, 확인 포인트",
-    "expected_output": "플랜 단계, 리스크 포인트, 태스크 초안",
-    "source_url": "http://127.0.0.1:7200/planner/plan",
-    "transport": "http",
-    "auth_required": false,
-    "risk_level": "low",
-    "enabled": true
-  },
-  {
     "id": "filesystem",
     "name": "Filesystem MCP",
     "scope": "파일",
@@ -69,25 +51,6 @@
     "expected_output": "문서 본문, 요약, 핵심 참조 정보",
     "source_url": "https://github.com/modelcontextprotocol/servers/tree/main/src/fetch",
     "package_name": "@modelcontextprotocol/server-fetch",
-    "transport": "stdio",
-    "auth_required": false,
-    "risk_level": "low",
-    "enabled": true
-  },
-  {
-    "id": "memory",
-    "name": "Memory MCP",
-    "scope": "기억",
-    "description": "세션 중 승인 상태와 의사결정 맥락을 유지합니다.",
-    "capabilities": [
-      "결정사항 보존",
-      "수정 이력 추적",
-      "세션 맥락 주입"
-    ],
-    "expected_input": "이전 플랜, 수정 요청, 승인 이력",
-    "expected_output": "지속 컨텍스트, 후속 판단 힌트",
-    "source_url": "https://github.com/modelcontextprotocol/servers/tree/main/src/memory",
-    "package_name": "@modelcontextprotocol/server-memory",
     "transport": "stdio",
     "auth_required": false,
     "risk_level": "low",
