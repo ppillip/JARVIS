@@ -11,13 +11,11 @@ from typing import Any, Dict, List
 
 CAPABILITY_KEYWORDS = {
     "filesystem": ["filesystem", "파일", "폴더", "디렉터리", "경로", "read", "write"],
-    "search_read": ["fetch", "docs", "문서", "조회", "검색", "참조"],
     "analyze_summarize": ["분석", "요약", "정리", "판단", "계획"],
-    "notify_send": ["알림", "전송", "notify", "send"],
-    "schedule_calendar": ["일정", "calendar", "schedule"],
-    "code_execution": ["코드", "실행", "exec", "terminal", "browser", "검증"],
-    "memory_context": ["memory", "맥락", "세션", "이력", "기억"],
-    "external_api": ["github", "api", "외부", "원격", "협업"],
+    "browser_automation": ["playwright", "browser", "브라우저", "클릭", "입력", "화면", "렌더링", "스크린샷", "snapshot", "검증"],
+    "ui_validation": ["ui", "화면", "시각", "검증", "렌더링", "흐름"],
+    "legal_research": ["법령", "판례", "조문", "법률", "시행령", "시행규칙", "행정규칙", "자치법규", "법제처", "precedent", "ordinance", "interpretation", "law"],
+    "code_execution": ["코드", "실행", "exec"],
 }
 
 

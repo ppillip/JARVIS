@@ -1,12 +1,33 @@
+# Python
 __pycache__/
-.DS_Store
-.playwright-cli/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Virtual environments
 backend/.venv/
 backend/.venv-py39-backup/
+
+# Environment variables (민감 정보)
 backend/.env
+
+# SQLite runtime files
 data/jarvis.db
 data/jarvis.db-shm
 data/jarvis.db-wal
+data/jarvis.db-journal
+
+# Playwright CLI logs & snapshots
+.playwright-cli/
+backend/.playwright-cli/
+
+# Playwright output (screenshots)
+output/
+
+# Node.js
 frontend/node_modules/
 frontend/dist/
 mcp-runtime/node_modules/
+
+# macOS
+.DS_Store

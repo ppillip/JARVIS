@@ -34,11 +34,14 @@
   };
   let authBusy = false;
   let chatBusy = false;
+  let conversationsBusy = false;
   let liveStatusText = "";
   let previousResponseId = null;
   let currentRunId = null;
   let traceEvents = [];
   let tracePanelOpen = false;
+  let conversationSummaries = [];
+  let activeConversationId = null;
   let commandInputRef;
   let chatLogRef;
   let mcpSocket;
@@ -47,6 +50,7 @@
   $: selectedMcp = mcps.find((mcp) => mcp.id === selectedMcpId) ?? mcps[0];
   $: activeTask = tasks.find((task) => task.status === "in_progress") ?? tasks[0];
   $: linkedTasks = selectedMcp ? tasks.filter((task) => task.mcp_ids.includes(selectedMcp.id)) : [];
+  $: activeConversationSummary = conversationSummaries.find((item) => item.conversation_id === activeConversationId) ?? null;
 
   onMount(async () => {
     await refreshBootstrapState();
@@ -125,6 +129,7 @@
         selectedMcpId = response.workflow.plan?.proposed_tasks?.[0]?.recommended_mcp_ids?.[0] ?? selectedMcpId;
       }
       await refreshTimeline();
+      await refreshConversationSummaries();
       command = "";
     } catch (error) {
       console.error(error);
@@ -159,6 +164,7 @@
       approval = response.approval;
       mcps = response.mcps;
       await refreshTimeline();
+      await refreshConversationSummaries();
     } finally {
       chatBusy = false;
       liveStatusText = "";
@@ -183,6 +189,7 @@
     activeSideTab = "routing";
     selectedMcpId = response.tasks[0]?.mcp_ids?.[0] ?? selectedMcpId;
     await refreshTimeline();
+    await refreshConversationSummaries();
     try {
       liveStatusText = "승인된 태스크를 순차 실행하고 증적을 수집하는 중입니다.";
       appendOptimisticEvent("system_message", { text: "실행 중입니다." });
@@ -195,6 +202,7 @@
       phase = execution.phase;
       liveStatusText = "실행 결과를 정리해 보고서를 만드는 중입니다.";
       await refreshTimeline();
+      await refreshConversationSummaries();
     } catch (error) {
       console.error(error);
     } finally {
@@ -301,11 +309,12 @@
   }
 
   async function resetSession() {
-    await postJson("/api/conversation/reset", {});
+    const response = await postJson("/api/conversation/reset", {});
     stopRunTimer();
     command = "";
     currentCommand = "";
     previousResponseId = null;
+    activeConversationId = response.conversation_id;
     currentRunId = null;
     phase = "idle";
     approval = "pending";
@@ -319,6 +328,8 @@
     activeSideTab = "detail";
     selectedMcpId = "filesystem";
     timelineEvents = [];
+    await refreshConversationSummaries();
+    await focusComposer();
   }
 
   function formatMcpNames(ids) {
@@ -411,13 +422,16 @@
   }
 
   async function refreshBootstrapState() {
-    const [mcpResponse, authResponse] = await Promise.all([
+    const [mcpResponse, authResponse, conversationResponse] = await Promise.all([
       fetch("/api/mcps"),
       fetch("/api/auth/status", { credentials: "include" }),
+      fetch("/api/conversations", { credentials: "include" }),
     ]);
 
     mcps = await mcpResponse.json();
     authStatus = await authResponse.json();
+    conversationSummaries = await conversationResponse.json();
+    activeConversationId = conversationSummaries.find((item) => item.current)?.conversation_id ?? activeConversationId;
     await refreshTimeline();
   }
 
@@ -429,7 +443,42 @@
   async function refreshTimeline() {
     const response = await fetch("/api/conversation/events", { credentials: "include" });
     timelineEvents = await response.json();
+    activeConversationId = timelineEvents[0]?.conversation_id ?? activeConversationId;
     hydrateCurrentWorkflow();
+  }
+
+  async function refreshConversationSummaries() {
+    const response = await fetch("/api/conversations", { credentials: "include" });
+    conversationSummaries = await response.json();
+    activeConversationId = conversationSummaries.find((item) => item.current)?.conversation_id ?? activeConversationId;
+  }
+
+  async function selectConversation(conversationId) {
+    if (!conversationId || conversationId === activeConversationId || chatBusy || conversationsBusy) return;
+    conversationsBusy = true;
+    try {
+      const summary = await postJson("/api/conversations/select", { conversation_id: conversationId });
+      activeConversationId = summary.conversation_id;
+      previousResponseId = null;
+      tracePanelOpen = false;
+      await refreshTimeline();
+      await refreshConversationSummaries();
+    } finally {
+      conversationsBusy = false;
+      await focusComposer();
+    }
+  }
+
+  function formatConversationDate(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    return new Intl.DateTimeFormat("ko-KR", {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(date);
   }
 
   function hydrateCurrentWorkflow() {
@@ -470,9 +519,50 @@
       <p class="eyebrow">MISSION CONTROL</p>
       <h1>JARVIS</h1>
       <p class="sidebar-copy">
-        지령을 받으면 계획을 세우고, 승인받고, 실행 태스크를 확정한 뒤 그대로 수행하는 자비스형 챗봇입니다.
+        대화 세션을 기준으로 지령, 승인, 실행 이력을 이어서 관리합니다.
       </p>
     </div>
+
+    <section class="conversation-panel">
+      <div class="conversation-panel-header">
+        <div>
+          <p class="eyebrow">CONVERSATIONS</p>
+          <h2>이전 대화</h2>
+        </div>
+      </div>
+
+      {#if activeConversationId && !activeConversationSummary}
+        <button type="button" class:selected={true} class="conversation-item draft">
+          <div class="conversation-item-header">
+            <span class="conversation-time">현재</span>
+          </div>
+          <strong class="conversation-title">새 대화</strong>
+        </button>
+      {/if}
+
+      <div class="conversation-list">
+        {#if conversationSummaries.length}
+          {#each conversationSummaries as conversation}
+            <button
+              type="button"
+              class:selected={conversation.conversation_id === activeConversationId}
+              class="conversation-item"
+              disabled={chatBusy || conversationsBusy}
+              on:click={() => selectConversation(conversation.conversation_id)}
+            >
+              <div class="conversation-item-header">
+                <span class="conversation-time">{formatConversationDate(conversation.updated_at)}</span>
+              </div>
+              <strong class="conversation-title">{conversation.title}</strong>
+            </button>
+          {/each}
+        {:else}
+          <div class="conversation-empty">
+            아직 저장된 이전 대화가 없습니다.
+          </div>
+        {/if}
+      </div>
+    </section>
 
     <section class="status-panel">
       <div class="status-card auth-card">
@@ -515,12 +605,15 @@
         <div>
           <p class="eyebrow">CHAT INTERFACE</p>
           <div class="panel-title-row">
-            <h2>JARVIS Console</h2>
+            <h2>{activeConversationSummary?.title ?? "JARVIS Console"}</h2>
             <div class:active={chatBusy} class="processing-indicator">
               <span class="processing-dot"></span>
               <span>{chatBusy ? "PROCESSING" : "STANDBY"}</span>
             </div>
           </div>
+          <p class="panel-subtitle">
+            {activeConversationSummary?.preview ?? "현재 세션에서 이어서 질문하거나 새 대화를 시작할 수 있습니다."}
+          </p>
         </div>
         <div class="header-actions">
           <button
@@ -696,13 +789,6 @@
         {/each}
       </div>
 
-      {#if chatBusy && liveStatusText}
-        <div class="live-status-panel">
-          <span class="live-status-label">현재 처리 중</span>
-          <strong>{liveStatusText}</strong>
-        </div>
-      {/if}
-
       <div class="workflow-status-bar">
         <span class="status-pill">단계: {phaseLabels[phase] ?? phase}</span>
         <span class="status-pill">승인: {approval === "approved" ? "승인됨" : "검토 필요"}</span>
@@ -726,6 +812,12 @@
             ? "예: 새 랜딩 페이지를 만들고, API 연동 전까지는 목업 데이터로 검증해."
             : "OpenAI 로그인 후 질문을 입력할 수 있습니다."}
         ></textarea>
+        {#if chatBusy && liveStatusText}
+          <div class="composer-status">
+            <span class="composer-status-label">현재 내부 동작 상태</span>
+            <strong>{liveStatusText}</strong>
+          </div>
+        {/if}
         <button class:pulse={chatBusy} class="primary-button" disabled={!canSubmit} type="submit">
           {chatBusy ? "처리 중..." : "질문 보내기"}
         </button>

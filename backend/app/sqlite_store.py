@@ -18,6 +18,7 @@ DATA_DIR = PROJECT_ROOT / "data"
 DB_PATH = DATA_DIR / "jarvis.db"
 LEGACY_MCP_REGISTRY_PATH = PROJECT_ROOT / "backend" / "app" / "mcp_registry.json"
 LEGACY_PROMPT_DB_PATH = PROJECT_ROOT / "data" / "prompts.json"
+DEPRECATED_MCP_IDS = {"planner", "memory", "browser", "git", "fetch", "github", "docs", "terminal"}
 
 
 def now_iso() -> str:
@@ -176,6 +177,64 @@ def migrate_legacy_registry(conn: sqlite3.Connection) -> None:
         )
 
 
+def sync_legacy_registry(conn: sqlite3.Connection) -> None:
+    """legacy MCP JSON을 현재 SQLite 레지스트리와 동기화한다."""
+    if not LEGACY_MCP_REGISTRY_PATH.exists():
+        return
+
+    raw = json.loads(LEGACY_MCP_REGISTRY_PATH.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        return
+
+    timestamp = now_iso()
+    for item in raw:
+        conn.execute(
+            """
+            INSERT INTO mcp_registry (
+                id, name, scope, description, capabilities_json, expected_input,
+                expected_output, source_url, package_name, transport,
+                auth_required, risk_level, enabled, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                scope = excluded.scope,
+                description = excluded.description,
+                capabilities_json = excluded.capabilities_json,
+                expected_input = excluded.expected_input,
+                expected_output = excluded.expected_output,
+                source_url = excluded.source_url,
+                package_name = excluded.package_name,
+                transport = excluded.transport,
+                auth_required = excluded.auth_required,
+                risk_level = excluded.risk_level,
+                enabled = excluded.enabled,
+                updated_at = excluded.updated_at
+            """,
+            (
+                item.get("id"),
+                item.get("name"),
+                item.get("scope"),
+                item.get("description"),
+                json.dumps(item.get("capabilities", []), ensure_ascii=False),
+                item.get("expected_input", ""),
+                item.get("expected_output", ""),
+                item.get("source_url"),
+                item.get("package_name"),
+                item.get("transport"),
+                1 if item.get("auth_required") else 0,
+                item.get("risk_level", "low"),
+                1 if item.get("enabled", True) else 0,
+                timestamp,
+                timestamp,
+            ),
+        )
+
+
+def cleanup_deprecated_registry_entries(conn: sqlite3.Connection) -> None:
+    """현재 운영 구조에서 더 이상 쓰지 않는 MCP 항목을 제거한다."""
+    conn.executemany("DELETE FROM mcp_registry WHERE id = ?", [(mcp_id,) for mcp_id in sorted(DEPRECATED_MCP_IDS)])
+
+
 def migrate_legacy_prompts(conn: sqlite3.Connection) -> None:
     """초기 실행 시 legacy prompt JSON을 SQLite prompt DB로 이관한다."""
     if row_count(conn, "prompt_definitions") > 0 or not LEGACY_PROMPT_DB_PATH.exists():
@@ -221,6 +280,8 @@ def initialize_database() -> None:
     with connect() as conn:
         create_tables(conn)
         migrate_legacy_registry(conn)
+        sync_legacy_registry(conn)
+        cleanup_deprecated_registry_entries(conn)
         migrate_legacy_prompts(conn)
         conn.commit()
 
@@ -716,3 +777,73 @@ def list_conversation_events(conversation_id: str) -> List[Dict[str, Any]]:
         }
         for row in rows
     ]
+
+
+def summarize_conversation(conversation_id: str, events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """대화 이벤트 배열을 좌측 패널용 요약 정보로 압축한다."""
+    if not events:
+        return None
+
+    def extract_text(event: Dict[str, Any]) -> str:
+        payload = event.get("payload") or {}
+        text = str(payload.get("text") or "").strip()
+        if text:
+            return " ".join(text.split())
+        if event.get("event_type") == "workflow_snapshot":
+            plan = payload.get("plan") or {}
+            summary = str(plan.get("summary") or "").strip()
+            if summary:
+                return " ".join(summary.split())
+            phase = str(payload.get("phase") or "").strip()
+            if phase:
+                return f"workflow:{phase}"
+        return ""
+
+    def shorten(text: str, limit: int = 72) -> str:
+        return text if len(text) <= limit else f"{text[:limit - 1].rstrip()}…"
+
+    first_user_text = next(
+        (extract_text(event) for event in events if event.get("event_type") == "user_message" and extract_text(event)),
+        "",
+    )
+    first_visible_text = next((extract_text(event) for event in events if extract_text(event)), "")
+    last_visible_text = next((extract_text(event) for event in reversed(events) if extract_text(event)), "")
+
+    created_at = str(events[0].get("created_at") or now_iso())
+    updated_at = str(events[-1].get("created_at") or created_at)
+    title = shorten(first_user_text or first_visible_text or "새 대화", 56)
+    preview = shorten(last_visible_text or title, 88)
+
+    return {
+        "conversation_id": conversation_id,
+        "title": title,
+        "preview": preview,
+        "event_count": len(events),
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+
+
+def list_conversation_summaries(limit: int = 50) -> List[Dict[str, Any]]:
+    """최근 대화 목록을 마지막 활동 순으로 반환한다."""
+    initialize_database()
+    safe_limit = max(1, min(limit, 200))
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT conversation_id, MAX(created_at) AS updated_at
+            FROM conversation_events
+            GROUP BY conversation_id
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        ).fetchall()
+
+    summaries: List[Dict[str, Any]] = []
+    for row in rows:
+        conversation_id = str(row["conversation_id"])
+        summary = summarize_conversation(conversation_id, list_conversation_events(conversation_id))
+        if summary:
+            summaries.append(summary)
+    return summaries

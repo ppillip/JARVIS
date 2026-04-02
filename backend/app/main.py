@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import threading
 import time
 import tempfile
@@ -33,12 +34,16 @@ import uvicorn
 
 from app.agent_runtime import RuntimePlan, RuntimeTask
 from app.capability_map_service import build_capability_map
+from app.capability_resolver import resolve_capability
+from app.fallback_policy import build_decline_from_resolution
+from app.intent_router import adjudicate_intent
 from app.filesystem_skill import execute_filesystem_task
 from app.llm_bridge import extract_json_object, invoke_bridge_text
 from app.plan_normalizer import normalize_runtime_plan
 from app.plan_schema import NormalizedPlan, NormalizedTaskDraft, PlannerMetadata
 from app.prompt_store import get_prompt_content, render_prompt_template
 from app.runtime_factory import get_executor_runtime, get_planner_runtime
+from app.tool_answer_runtime import ToolAnswerRuntime
 from app.sqlite_store import (
     activate_prompt_version as activate_prompt_version_store,
     append_conversation_event,
@@ -48,6 +53,7 @@ from app.sqlite_store import (
     get_workflow_run,
     initialize_database,
     list_conversation_events,
+    list_conversation_summaries,
     list_workflow_runs,
     list_prompt_entries,
     list_registry_entries as list_registry_entries_from_db,
@@ -66,6 +72,7 @@ PLANNER_MCP_URL = os.getenv("PLANNER_MCP_URL", "http://127.0.0.1:7200/planner/pl
 MCP_RUNTIME_ROOT = PROJECT_ROOT / "mcp-runtime"
 FILESYSTEM_MCP_BIN = MCP_RUNTIME_ROOT / "node_modules" / ".bin" / "mcp-server-filesystem"
 MCP_PROTOCOL_VERSION = "2025-11-25"
+TOOL_ANSWER_RUNTIME = ToolAnswerRuntime()
 
 
 class MpcDefinition(BaseModel):
@@ -167,7 +174,7 @@ class ChatResponse(BaseModel):
     reply: str
     response_id: Optional[str] = None
     model: str
-    mode: Literal["answer", "plan"] = "answer"
+    mode: Literal["answer", "tool_answer", "plan", "decline"] = "answer"
     workflow: Optional[Dict[str, Any]] = None
 
 
@@ -255,6 +262,24 @@ class ConversationEventRecord(BaseModel):
     created_at: str
 
 
+class ConversationSummaryRecord(BaseModel):
+    """좌측 패널에 노출할 대화 세션 요약 구조."""
+
+    conversation_id: str
+    title: str
+    preview: str
+    event_count: int
+    created_at: str
+    updated_at: str
+    current: bool = False
+
+
+class ConversationSelectRequest(BaseModel):
+    """브라우저 세션이 바라볼 active conversation 변경 요청."""
+
+    conversation_id: str = Field(..., min_length=1)
+
+
 class RegistryToggleRequest(BaseModel):
     """레지스트리 항목 활성/비활성 요청."""
 
@@ -338,31 +363,22 @@ DEFAULT_MCP_CATALOG = [
         expected_output="변경 파일, 구조 정보, 산출물 목록",
     ),
     MpcDefinition(
-        id="terminal",
-        name="Terminal MCP",
-        scope="실행",
-        description="명령 실행, 테스트, 빌드, 로그 수집을 담당합니다.",
-        capabilities=["명령 실행", "테스트 수행", "빌드 결과 확인"],
-        expected_input="실행 명령, 환경 조건, 작업 디렉터리",
-        expected_output="실행 결과, 로그, 오류 정보",
+        id="playwright",
+        name="Playwright MCP",
+        scope="브라우저",
+        description="실제 브라우저를 열어 페이지 이동, 클릭, 입력, 스냅샷, 스크린샷 기반 UI 검증을 수행합니다.",
+        capabilities=["브라우저 자동화", "페이지 열기", "클릭/입력", "스냅샷/스크린샷", "UI 흐름 검증"],
+        expected_input="URL, 액션 시나리오, 요소 ref, 입력값, 검증 대상",
+        expected_output="브라우저 상태, 스냅샷, 검증 결과, 스크린샷 경로",
     ),
     MpcDefinition(
-        id="browser",
-        name="Browser MCP",
-        scope="검증",
-        description="UI 흐름과 렌더링 상태를 검증합니다.",
-        capabilities=["시각 검증", "흐름 점검", "렌더링 확인"],
-        expected_input="화면 대상, 검증 시나리오, 비교 기준",
-        expected_output="검증 결과, 이슈 목록, 화면 상태",
-    ),
-    MpcDefinition(
-        id="docs",
-        name="Docs MCP",
-        scope="참조",
-        description="문서와 레퍼런스를 조회해 규격 판단을 보조합니다.",
-        capabilities=["문서 조회", "규격 확인", "참조 요약"],
-        expected_input="문서 대상, API 이름, 필요한 규격 포인트",
-        expected_output="참조 정보, 요약 규격, 사용 가이드",
+        id="korean_law",
+        name="Korean Law MCP",
+        scope="법령",
+        description="법제처 Open API 기반으로 법령, 조문, 판례, 행정규칙, 자치법규, 법령해석을 검색하고 본문을 조회합니다.",
+        capabilities=["법령 검색", "조문 조회", "판례 검색", "행정규칙/자치법규 조회", "법령해석 조회"],
+        expected_input="질의어, 법령명, 조문 번호, 판례 검색어, LAW_OC API 키",
+        expected_output="검색 결과 목록, 본문, 조문 텍스트, 판례/해석 요약",
     ),
 ]
 
@@ -516,6 +532,25 @@ def enrich_mcp_definition(mcp: MpcDefinition) -> MpcDefinition:
                 "허용 경로는 $HOME, $PROJECT_ROOT 로 제한됨",
                 "path 변수 사용 가능: $HOME, $PROJECT_ROOT",
                 "읽기 중심 조회는 list_directory 또는 directory_tree를 우선 사용",
+            ]
+        )
+    if mcp.id == "playwright":
+        capabilities.extend(
+            [
+                "tools:open(url, headed?), snapshot(), click(ref), fill(ref,text), press(key), screenshot(path?)",
+                "실제 브라우저 자동화가 필요할 때 선택",
+                "요소 조작 전 snapshot으로 ref를 수집하는 흐름을 우선 사용",
+                "UI 검증과 사용자 흐름 재현에 사용",
+            ]
+        )
+    if mcp.id == "korean_law":
+        capabilities.extend(
+            [
+                "tools:search_law(query), get_law_text(mst, jo?), search_precedents(query), get_precedent_text(id)",
+                "tools:search_admin_rule(query), get_admin_rule(id), search_ordinance(query), get_ordinance(id)",
+                "tools:search_interpretations(query), get_interpretation_text(id), search_all(query)",
+                "법제처 Open API 키 LAW_OC 가 필요함",
+                "국가 법령, 조문, 판례, 행정규칙, 자치법규, 법령해석 조회에 사용",
             ]
         )
     return mcp.model_copy(update={"capabilities": list(dict.fromkeys(capabilities))})
@@ -832,6 +867,30 @@ def get_conversation_events(request: Request) -> List[ConversationEventRecord]:
     ]
 
 
+@app.get("/api/conversations", response_model=List[ConversationSummaryRecord])
+def get_conversation_summaries(request: Request, limit: int = 50) -> List[ConversationSummaryRecord]:
+    """최근 대화 세션 목록을 반환한다."""
+    current_id = get_conversation_id(request)
+    safe_limit = max(1, min(limit, 100))
+    return [
+        ConversationSummaryRecord(**item, current=item["conversation_id"] == current_id)
+        for item in list_conversation_summaries(safe_limit)
+    ]
+
+
+@app.post("/api/conversations/select", response_model=ConversationSummaryRecord)
+def select_conversation(request: Request, payload: ConversationSelectRequest) -> ConversationSummaryRecord:
+    """기존 대화 세션 하나를 현재 브라우저 세션에 연결한다."""
+    summary = next(
+        (item for item in list_conversation_summaries(200) if item["conversation_id"] == payload.conversation_id),
+        None,
+    )
+    if not summary:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    request.session["conversation_id"] = payload.conversation_id
+    return ConversationSummaryRecord(**summary, current=True)
+
+
 @app.post("/api/conversation/reset")
 def reset_conversation(request: Request) -> Dict[str, str]:
     """세션의 conversation_id를 새로 발급해 새 타임라인을 시작한다."""
@@ -1022,14 +1081,21 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
     message = payload.message.strip()
     append_message_event(request, "user_message", message)
     mcps = load_mcp_catalog()
-    capability_map = build_planner_capability_map(mcps)
+    adjudication = await adjudicate_intent(
+        model=model,
+        message=message,
+        mcp_catalog=[mcp.model_dump() for mcp in mcps],
+        conversation=payload.conversation,
+    )
+    resolution = await resolve_capability(
+        model=model,
+        message=message,
+        adjudication=adjudication,
+        mcp_catalog=[mcp.model_dump() for mcp in mcps],
+    )
 
-    try:
-        intent = await classify_chat_intent(model=model, message=message, mcps=mcps, conversation=payload.conversation)
-    except RuntimeError:
-        intent = fallback_chat_intent(message, payload.conversation)
-
-    if intent == "command":
+    if resolution.mode == "mcp_action":
+        capability_map = build_planner_capability_map(mcps)
         planner_context = {"trace": []}
         run_id = str(uuid.uuid4())
         runtime_plan = await get_planner().build_plan(
@@ -1080,12 +1146,41 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
             workflow=workflow.model_dump(),
         )
 
+    if resolution.mode == "mcp_retrieval":
+        try:
+            tool_response = await TOOL_ANSWER_RUNTIME.answer_question(
+                model=model,
+                message=message,
+                required_capabilities=resolution.required_capabilities,
+                mcp_catalog=[mcp.model_dump() for mcp in mcps],
+            )
+        except RuntimeError as exc:
+            reply = build_decline_from_resolution(
+                resolution.model_copy(update={"reason": str(exc)})
+            )
+            append_message_event(request, "assistant_message", reply)
+            return ChatResponse(reply=reply, response_id=None, model=model, mode="decline")
+
+        append_message_event(request, "assistant_message", tool_response["reply"])
+        return ChatResponse(
+            reply=tool_response["reply"],
+            response_id=tool_response.get("response_id"),
+            model=model,
+            mode="tool_answer",
+        )
+
+    if resolution.mode == "decline":
+        reply = build_decline_from_resolution(resolution)
+        append_message_event(request, "assistant_message", reply)
+        return ChatResponse(reply=reply, response_id=None, model=model, mode="decline")
+
     try:
         reply, response_id = await create_chat_response(
             model=model,
             message=message,
             previous_response_id=payload.previous_response_id,
             conversation=payload.conversation,
+            mcps=mcps,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -1662,13 +1757,40 @@ def fallback_chat_intent(message: str, conversation: Optional[List[Dict[str, str
     """LLM 분류 실패 시 질문/지령을 대략적으로 판정한다."""
     normalized = message.strip().lower()
     history_text = " ".join(str(item.get("content", "")) for item in (conversation or [])[-6:]).lower()
-    command_markers = ["구현", "만들", "고쳐", "정리", "설계", "추가", "삭제", "수정", "작성", "해줘", "해라"]
+    command_markers = ["구현", "만들", "고쳐", "정리", "설계", "추가", "삭제", "수정", "작성", "개발", "리팩토링", "열어", "띄워", "실행", "이동", "클릭", "보여줘"]
+    polite_command_markers = ["해줘", "해라"]
     followup_markers = ["보여", "보여줘", "다시", "설명", "어디", "뭐였", "목록", "리스트"]
+    information_markers = [
+        "날씨",
+        "시간",
+        "날짜",
+        "환율",
+        "주가",
+        "뜻",
+        "의미",
+        "정의",
+        "요약",
+        "설명",
+        "비교",
+        "추천",
+        "알려줘",
+        "알려주",
+        "조회",
+        "찾아",
+        "뭐야",
+        "무엇",
+        "왜",
+        "어떻게",
+    ]
     if any(marker in normalized for marker in followup_markers) and ("보고합니다" in history_text or "폴더 목록" in history_text or "실행 근거" in history_text):
         return "question"
     if "?" in normalized:
         return "question"
+    if any(marker in normalized for marker in information_markers) and not any(marker in normalized for marker in command_markers):
+        return "question"
     if any(marker in normalized for marker in command_markers):
+        return "command"
+    if any(marker in normalized for marker in polite_command_markers) and not any(marker in normalized for marker in information_markers):
         return "command"
     return "question"
 
@@ -1687,8 +1809,10 @@ async def classify_chat_intent(
             "반드시 JSON 객체 하나만 출력한다.\n"
             '형식: {"intent":"question"} 또는 {"intent":"command"}\n'
             "판정 기준:\n"
-            "- question: 설명, 정의, 비교, 의견, 원인 질문\n"
-            "- command: 무언가를 만들기/고치기/설계하기/진행하기를 요구하는 지시\n\n"
+            "- question: 설명, 정의, 비교, 의견, 원인 질문, 사실 조회, 요약 요청\n"
+            "- command: 무언가를 만들기/고치기/설계하기/진행하기를 요구하는 지시\n"
+            "- 말투가 명령형이어도 실질이 정보 질의면 question이다. 예: 날씨 알려줘라, 의미를 설명해라, 최신 뉴스를 요약해줘.\n"
+            "- MCP나 외부 도구가 꼭 없어도 LLM이 바로 답할 수 있는 요청은 question이다.\n\n"
             "- 직전 대화의 실행 결과를 다시 보여달라거나 설명해달라는 후속 발화는 question이다.\n\n"
             "[대화 히스토리]\n{{conversation}}\n\n"
             "[현재 MCP REGISTRY]\n{{mcps}}\n\n"
@@ -1716,17 +1840,22 @@ async def create_chat_response(
     message: str,
     previous_response_id: Optional[str],
     conversation: List[Dict[str, str]],
+    mcps: List[MpcDefinition],
 ) -> tuple[str, Optional[str]]:
     """일반 질문에 대한 JARVIS 답변을 생성한다."""
     _ = previous_response_id
     soul_prompt = read_soul_prompt()
+    mcp_status_prompt = serialize_mcp_runtime_status(mcps)
     template = get_prompt_content(
         "chat_system",
         fallback=(
             "너는 JARVIS의 채팅 처리 엔진이다. "
             "항상 한국어로 답하고, 간결하지만 실제로 도움이 되게 답해라. "
-            "코드/개발 질문이면 실무적으로 답하고, 모르면 추측하지 말고 부족한 점을 짧게 밝혀라.\n\n"
+            "코드/개발 질문이면 실무적으로 답하고, 모르면 추측하지 말고 부족한 점을 짧게 밝혀라.\n"
+            "특히 MCP 존재 여부, 활성 상태, 실행 가능 여부를 묻는 질문에는 추측하지 말고 아래 현재 MCP 상태를 근거로만 답해라.\n"
+            "등록은 되어 있지만 설정이 부족한 MCP는 '등록됨/미설정'으로 명확히 구분해서 말해라.\n\n"
             "[SOUL]\n{{soul}}\n\n"
+            "[현재 MCP 상태]\n{{mcp_status}}\n\n"
             "[대화 히스토리]\n{{conversation}}\n\n"
             "[사용자 질문]\n{{message}}"
         ),
@@ -1736,11 +1865,47 @@ async def create_chat_response(
         template,
         {
             "soul": soul_prompt,
+            "mcp_status": mcp_status_prompt,
             "conversation": conversation_prompt,
             "message": message,
         },
     )
     return await invoke_bridge_text(model=model, prompt=full_prompt)
+
+
+def serialize_mcp_runtime_status(mcps: List[MpcDefinition]) -> str:
+    """일반 답변 프롬프트에 넣을 현재 MCP 등록/설정 상태 요약을 만든다."""
+    items: List[Dict[str, Any]] = []
+    for mcp in mcps:
+        entry: Dict[str, Any] = {
+            "id": mcp.id,
+            "name": mcp.name,
+            "enabled": True,
+            "registered": True,
+            "transport": getattr(mcp, "transport", None),
+            "auth_required": getattr(mcp, "auth_required", False),
+        }
+        if mcp.id == "filesystem":
+            entry["runtime_status"] = "ready" if FILESYSTEM_MCP_BIN.exists() else "missing_binary"
+        elif mcp.id == "playwright":
+            code_home = Path(os.getenv("CODEX_HOME", str(Path.home() / ".codex")))
+            playwright_cli = code_home / "skills" / "playwright" / "scripts" / "playwright_cli.sh"
+            entry["runtime_status"] = "ready" if playwright_cli.exists() else "missing_wrapper"
+        elif mcp.id == "korean_law":
+            command_path = shutil.which(os.getenv("KOREAN_LAW_MCP_COMMAND", "korean-law-mcp") or "korean-law-mcp")
+            law_oc = str(os.getenv("LAW_OC", "")).strip()
+            if command_path and law_oc:
+                entry["runtime_status"] = "ready"
+            elif command_path and not law_oc:
+                entry["runtime_status"] = "registered_but_missing_law_oc"
+            else:
+                entry["runtime_status"] = "registered_but_missing_command"
+            entry["command_found"] = bool(command_path)
+            entry["law_oc_set"] = bool(law_oc)
+        else:
+            entry["runtime_status"] = "registered"
+        items.append(entry)
+    return json.dumps(items, ensure_ascii=False, indent=2)
 
 
 def format_conversation_history(conversation: List[Dict[str, str]]) -> str:

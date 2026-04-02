@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -26,6 +27,9 @@ class ClassicRuntimeConfig:
     project_root: Path
     home_root: Path
     filesystem_mcp_bin: Path
+    codex_home: Path
+    playwright_cli: Path
+    korean_law_mcp_command: str
     mcp_protocol_version: str
 
 
@@ -33,12 +37,18 @@ def load_classic_runtime_config() -> ClassicRuntimeConfig:
     """프로젝트 루트, 홈 경로, MCP 바이너리 위치를 읽어 설정을 만든다."""
     project_root = Path(__file__).resolve().parents[2]
     home_root = Path.home()
+    codex_home = Path(os.getenv("CODEX_HOME", str(home_root / ".codex")))
     mcp_runtime_root = project_root / "mcp-runtime"
     filesystem_mcp_bin = mcp_runtime_root / "node_modules" / ".bin" / "mcp-server-filesystem"
+    playwright_cli = codex_home / "skills" / "playwright" / "scripts" / "playwright_cli.sh"
+    korean_law_mcp_command = os.getenv("KOREAN_LAW_MCP_COMMAND", shutil.which("korean-law-mcp") or "korean-law-mcp")
     return ClassicRuntimeConfig(
         project_root=project_root,
         home_root=home_root,
         filesystem_mcp_bin=filesystem_mcp_bin,
+        codex_home=codex_home,
+        playwright_cli=playwright_cli,
+        korean_law_mcp_command=korean_law_mcp_command,
         mcp_protocol_version="2025-11-25",
     )
 
@@ -182,6 +192,12 @@ def build_planner_prompt(command: str, soul: str, mcp_catalog: List[Dict[str, An
             "- 최종 보고는 시스템이 수행하므로 '보고용 정리 단계'를 별도 step으로 만들지 않는다.\n"
             "- MCP capability에 tool 정보가 있으면 tool_name과 tool_arguments를 반드시 채운다.\n"
             "- Filesystem MCP의 허용 경로가 $HOME, $PROJECT_ROOT 로 제한되어 있으면 그 범위를 벗어나는 path를 계획하지 않는다.\n"
+            "- Playwright MCP를 선택했으면 tool_name은 반드시 open, snapshot, click, fill, press, screenshot 중 하나만 사용한다.\n"
+            "- open_page, goto, navigate 같은 별칭은 사용하지 않는다. 반드시 open을 쓴다.\n"
+            "- Playwright open의 tool_arguments는 최소 {\"url\":\"https://...\"} 형태를 포함해야 한다.\n"
+            "- Playwright fill은 한 task에 한 입력란만 다룬다. 여러 입력란이면 fill task를 여러 개로 분해한다.\n"
+            "- Playwright fill의 tool_arguments는 {\"target\":\"입력란 라벨 또는 의미\",\"value\":\"실제 입력값\"} 형태를 사용한다.\n"
+            "- Playwright click에서 ref를 모르면 target 또는 label만 넘기고, executor가 snapshot으로 ref를 찾게 한다.\n"
             "- 경로는 필요하면 $HOME 또는 $PROJECT_ROOT 변수를 사용한다.\n"
             "- 각 step은 승인 후 실행 가능한 작업 단계여야 한다.\n"
             "- rationale은 한 문장으로 짧게 쓴다.\n"
@@ -228,10 +244,11 @@ def validate_runtime_plan_mcp_ids(items: List[RuntimeTask], mcp_catalog: List[Di
 class StdioMcpClient:
     """stdio 기반 MCP 서버와 JSON-RPC로 통신하는 최소 클라이언트."""
 
-    def __init__(self, command: List[str], protocol_version: str) -> None:
+    def __init__(self, command: List[str], protocol_version: str, env: Optional[Dict[str, str]] = None) -> None:
         """실행 커맨드와 프로토콜 버전을 저장한다."""
         self.command = command
         self.protocol_version = protocol_version
+        self.env = env
         self.process: Optional[asyncio.subprocess.Process] = None
         self._request_id = 0
 
@@ -242,6 +259,7 @@ class StdioMcpClient:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=self.env,
         )
         await self.initialize()
         return self

@@ -6,11 +6,14 @@ planner 책임을 갖지 않고, 확정된 task만 집행하며 evidence, trace,
 안정적으로 축적하는 집행 전용 런타임이다.
 """
 
+import os
 from typing import Any, Dict, List, Optional
 
 from app.agent_runtime import ExecutorRuntime, RuntimeExecutionResult, RuntimePlan, RuntimeTask
 from app.classic_runtime import ClassicRuntimeConfig, StdioMcpClient, load_classic_runtime_config
 from app.filesystem_skill import execute_filesystem_task
+from app.korean_law_skill import SUPPORTED_KOREAN_LAW_TOOLS, execute_korean_law_task
+from app.playwright_skill import execute_playwright_task
 from app.report_builder import build_execution_report
 from app.trace_logger import add_trace
 
@@ -49,11 +52,29 @@ class StableExecutorRuntime(ExecutorRuntime):
         findings: List[str] = []
         result_items: List[str] = []
         task_statuses: List[str] = []
+        execution_halted = False
 
         for index, task in enumerate(tasks, start=1):
             execution_log.append(f"Task {index}: {task.title}")
             selected_mcp_id = task.selected_mcp_id
             tool_name = task.tool_name
+            if execution_halted:
+                evidence.append(f"실행 보류: {task.title} - 이전 태스크 실패로 실행하지 않았습니다.")
+                findings.append(f"{task.title}: 선행 태스크 실패로 실행하지 않았습니다.")
+                execution_log.append(f"실행 보류: {task.title}")
+                task_statuses.append("failed")
+                add_trace(
+                    context,
+                    "executor.task_skipped",
+                    stage="execution",
+                    runtime="stable_executor",
+                    task_index=index,
+                    title=task.title,
+                    result="blocked_by_previous_failure",
+                    selected_mcp_id=selected_mcp_id,
+                    tool_name=tool_name,
+                )
+                continue
             add_trace(
                 context,
                 "executor.task_started",
@@ -92,11 +113,63 @@ class StableExecutorRuntime(ExecutorRuntime):
                     )
                     continue
 
+                if selected_mcp_id == "playwright" and tool_name in {"open", "snapshot", "click", "fill", "press", "screenshot", "read_text"}:
+                    skill_result = await execute_playwright_task(
+                        task=task,
+                        cli_path=self.config.playwright_cli,
+                        codex_home=self.config.codex_home,
+                        project_root=self.config.project_root,
+                    )
+                    evidence.extend(skill_result["evidence"])
+                    findings.extend(skill_result["findings"])
+                    if skill_result["result_items"]:
+                        result_items = skill_result["result_items"]
+                    execution_log.append(skill_result["log"])
+                    task_statuses.append("done")
+                    add_trace(
+                        context,
+                        "executor.task_completed",
+                        stage="execution",
+                        runtime="stable_executor",
+                        task_index=index,
+                        title=task.title,
+                        result="success",
+                        selected_mcp_id=selected_mcp_id,
+                        tool_name=tool_name,
+                    )
+                    continue
+
+                if selected_mcp_id == "korean_law" and tool_name in SUPPORTED_KOREAN_LAW_TOOLS:
+                    skill_result = await execute_korean_law_task(
+                        task=task,
+                        call_tool=self.call_korean_law_mcp,
+                        extract_tool_text=self.extract_tool_text,
+                    )
+                    evidence.extend(skill_result["evidence"])
+                    findings.extend(skill_result["findings"])
+                    if skill_result["result_items"]:
+                        result_items = skill_result["result_items"]
+                    execution_log.append(skill_result["log"])
+                    task_statuses.append("done")
+                    add_trace(
+                        context,
+                        "executor.task_completed",
+                        stage="execution",
+                        runtime="stable_executor",
+                        task_index=index,
+                        title=task.title,
+                        result="success",
+                        selected_mcp_id=selected_mcp_id,
+                        tool_name=tool_name,
+                    )
+                    continue
+
                 evidence.append(
                     f"실행 계획 미확정: {task.title} (selected_mcp_id={selected_mcp_id or '없음'}, tool_name={tool_name or '없음'})"
                 )
                 findings.append(f"{task.title}: MCP와 tool이 구조화되어 내려오지 않아 실제 호출 근거를 만들지 못했습니다.")
                 task_statuses.append("failed")
+                execution_halted = True
                 add_trace(
                     context,
                     "executor.task_failed",
@@ -113,6 +186,7 @@ class StableExecutorRuntime(ExecutorRuntime):
                 findings.append(f"{task.title}: 실행 중 오류가 발생했습니다. 오류 내용: {exc}")
                 execution_log.append(f"실행 실패: {task.title}")
                 task_statuses.append("failed")
+                execution_halted = True
                 add_trace(
                     context,
                     "executor.task_failed",
@@ -172,6 +246,18 @@ class StableExecutorRuntime(ExecutorRuntime):
             str(self.config.home_root),
         ]
         async with StdioMcpClient(command, self.config.mcp_protocol_version) as client:
+            return await client.request("tools/call", {"name": tool_name, "arguments": arguments})
+
+    async def call_korean_law_mcp(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Korean Law MCP stdio 서버를 띄워 법령/판례 tool call을 수행한다."""
+        law_oc = str(os.getenv("LAW_OC", "")).strip()
+        if not law_oc:
+            raise RuntimeError("LAW_OC 환경변수가 없어 Korean Law MCP를 실행할 수 없습니다.")
+
+        command = [self.config.korean_law_mcp_command]
+        env = os.environ.copy()
+        env["LAW_OC"] = law_oc
+        async with StdioMcpClient(command, self.config.mcp_protocol_version, env=env) as client:
             return await client.request("tools/call", {"name": tool_name, "arguments": arguments})
 
     @staticmethod
